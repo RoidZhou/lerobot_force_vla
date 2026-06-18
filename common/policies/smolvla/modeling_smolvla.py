@@ -60,7 +60,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from transformers import AutoProcessor
 
-from lerobot.common.constants import ACTION, OBS_STATE
+from lerobot.common.constants import ACTION, OBS_EFFORT, OBS_STATE
 from lerobot.common.policies.normalize import (
     Normalize,
     Unnormalize,
@@ -170,6 +170,21 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
+def pad_sequence(vector, new_len):
+    """Pads or trims the sequence dimension to keep the most recent values."""
+    if vector.shape[1] == new_len:
+        return vector
+    if vector.shape[1] > new_len:
+        return vector[:, -new_len:, :]
+
+    shape = list(vector.shape)
+    current_len = shape[1]
+    shape[1] = new_len
+    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
+    new_vector[:, -current_len:, :] = vector
+    return new_vector
+
+
 def normalize(x, min_val, max_val):
     return (x - min_val) / (max_val - min_val)
 
@@ -263,6 +278,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        if self.config.effort_type.endswith("_his_c") or self.config.effort_type.endswith("_his_t"):
+            self._queues[self.config.effort_key] = deque(maxlen=self.config.effort_history_steps)
+            for effort_key in (OBS_EFFORT, "effort", "force"):
+                if effort_key != self.config.effort_key:
+                    self._queues[effort_key] = deque(maxlen=self.config.effort_history_steps)
 
     def get_optim_params(self) -> dict:
         return self.parameters()
@@ -291,10 +311,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     batch[k] = torch.stack(list(self._queues[k]), dim=1)
             images, img_masks = self.prepare_images(batch)
             state = self.prepare_state(batch)
+            effort = self.prepare_effort(batch)
             lang_tokens, lang_masks = self.prepare_language(batch)
 
             actions = self.model.sample_actions(
-                images, img_masks, lang_tokens, lang_masks, state, noise=noise
+                images, img_masks, lang_tokens, lang_masks, state, effort=effort, noise=noise
             )
             # Unpad actions
             original_action_dim = self.config.action_feature.shape[0]
@@ -319,11 +340,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         batch = self.normalize_targets(batch)
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
+        effort = self.prepare_effort(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, effort, noise, time)
         loss_dict["losses_after_forward"] = losses.clone()
 
         if actions_is_pad is not None:
@@ -433,8 +455,39 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def prepare_state(self, batch):
         """Pad state"""
         state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        if self.config.effort_type == "state":
+            effort = self.prepare_effort(batch)
+            state = torch.cat([state, effort[:, -1, :]], dim=-1)
         state = pad_vector(state, self.config.max_state_dim)
         return state
+
+    def prepare_effort(self, batch):
+        """Prepare end-effector force/effort history as (batch_size, history, effort_dim)."""
+        if self.config.effort_type in {"none", "no"}:
+            return None
+
+        effort_key = None
+        for candidate_key in (self.config.effort_key, "force", OBS_EFFORT, "effort"):
+            if candidate_key in batch:
+                effort_key = candidate_key
+                break
+        if effort_key not in batch:
+            raise ValueError(
+                f"`effort_type={self.config.effort_type}` requires one of "
+                f"`{self.config.effort_key}`, `force`, `{OBS_EFFORT}`, or `effort` in the batch."
+            )
+
+        effort = batch[effort_key]
+        if effort.ndim == 2:
+            effort = effort[:, None, :]
+        elif effort.ndim != 3:
+            raise ValueError(f"Effort is expected to have shape (B, D) or (B, T, D), got {effort.shape}.")
+
+        effort = pad_vector(effort, self.config.effort_dim)
+        history_steps = self.config.effort_history_steps
+        if self.config.effort_type in {"llm", "expert", "state"}:
+            history_steps = 1
+        return pad_sequence(effort, history_steps)
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -494,6 +547,7 @@ class VLAFlowMatching(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.effort_type = self.config.effort_type
 
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
@@ -511,6 +565,28 @@ class VLAFlowMatching(nn.Module):
         )
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        if self.effort_type in {"llm", "llm_his_c", "llm_his_t"}:
+            effort_in_dim = self.config.effort_dim * self.config.effort_history_steps
+            if self.effort_type == "llm_his_t":
+                effort_in_dim = self.config.effort_dim
+            self.effort_proj_in = nn.Linear(
+                effort_in_dim, 2 * self.vlm_with_expert.config.text_config.hidden_size
+            )
+            self.effort_proj_out = nn.Linear(
+                2 * self.vlm_with_expert.config.text_config.hidden_size,
+                self.vlm_with_expert.config.text_config.hidden_size,
+            )
+        elif self.effort_type in {"expert", "expert_his_c", "expert_his_t"}:
+            effort_in_dim = self.config.effort_dim * self.config.effort_history_steps
+            if self.effort_type == "expert_his_t":
+                effort_in_dim = self.config.effort_dim
+            self.effort_proj_in = nn.Linear(effort_in_dim, 2 * self.vlm_with_expert.expert_hidden_size)
+            self.effort_proj_out = nn.Linear(
+                2 * self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
+            )
+        else:
+            self.effort_proj_in = None
+            self.effort_proj_out = None
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -533,6 +609,11 @@ class VLAFlowMatching(nn.Module):
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
+        if self.effort_proj_in is not None:
+            for params in self.effort_proj_in.parameters():
+                params.requires_grad = self.config.train_effort_proj
+            for params in self.effort_proj_out.parameters():
+                params.requires_grad = self.config.train_effort_proj
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -550,7 +631,7 @@ class VLAFlowMatching(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None, effort: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -616,6 +697,11 @@ class VLAFlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        effort_embs, effort_pad_masks, effort_att_masks = self._process_effort_tokens(effort, mode="prefix")
+        embs.extend(effort_embs)
+        pad_masks.extend(effort_pad_masks)
+        att_masks.extend(effort_att_masks)
+
         state_emb = self.state_proj(state)
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
         embs.append(state_emb)
@@ -643,11 +729,60 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
+    def _project_effort(self, effort: torch.Tensor) -> torch.Tensor:
+        effort_hidden = self.effort_proj_in(effort)
+        effort_hidden = F.silu(effort_hidden)
+        return self.effort_proj_out(effort_hidden)
+
+    def _process_effort_tokens(self, effort: torch.Tensor | None, mode: str):
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        if self.effort_type in {"none", "no", "state"}:
+            return embs, pad_masks, att_masks
+
+        prefix_effort_types = {"llm", "llm_his_c", "llm_his_t"}
+        suffix_effort_types = {"expert", "expert_his_c", "expert_his_t"}
+        if mode == "prefix" and self.effort_type not in prefix_effort_types:
+            return embs, pad_masks, att_masks
+        if mode == "suffix" and self.effort_type not in suffix_effort_types:
+            return embs, pad_masks, att_masks
+        if effort is None:
+            raise ValueError(f"`effort_type={self.effort_type}` requires an effort tensor.")
+
+        bsize = effort.shape[0]
+        device = effort.device
+        ar_mask_value = mode == "suffix"
+        if self.effort_type in {"llm", "expert"}:
+            effort_token = self._project_effort(effort[:, -1, :])[:, None, :]
+            embs.append(effort_token)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            att_masks.append(ar_mask_value)
+        elif self.effort_type in {"llm_his_c", "expert_his_c"}:
+            effort_token = self._project_effort(effort.reshape(bsize, -1))[:, None, :]
+            embs.append(effort_token)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            att_masks.append(ar_mask_value)
+        elif self.effort_type in {"llm_his_t", "expert_his_t"}:
+            for i in range(effort.shape[1]):
+                effort_token = self._project_effort(effort[:, i, :])[:, None, :]
+                embs.append(effort_token)
+                pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+                att_masks.append(ar_mask_value)
+
+        return embs, pad_masks, att_masks
+
+    def embed_suffix(self, noisy_actions, timestep, effort: torch.Tensor = None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
         att_masks = []
+
+        effort_embs, effort_pad_masks, effort_att_masks = self._process_effort_tokens(effort, mode="suffix")
+        embs.extend(effort_embs)
+        pad_masks.extend(effort_pad_masks)
+        att_masks.extend(effort_att_masks)
 
         # Fuse timestep + action information using an MLP
         action_emb = self.action_in_proj(noisy_actions)
@@ -687,7 +822,7 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, effort=None, noise=None, time=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -700,9 +835,9 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, effort=effort
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, effort=effort)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -724,7 +859,7 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
-    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> Tensor:
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, effort=None, noise=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
         device = state.device
@@ -734,7 +869,7 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, effort=effort
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -759,6 +894,7 @@ class VLAFlowMatching(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
+                effort,
             )
             # Euler step
             x_t += dt * v_t
@@ -771,9 +907,10 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        effort=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep, effort=effort)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

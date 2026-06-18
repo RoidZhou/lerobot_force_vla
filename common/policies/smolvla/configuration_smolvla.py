@@ -42,6 +42,16 @@ class SmolVLAConfig(PreTrainedConfig):
     max_state_dim: int = 32
     max_action_dim: int = 32
 
+    # End-effector force/effort sensor conditioning.
+    # Supported values mirror the TA-VLA pi0 design:
+    # "none", "state", "llm", "llm_his_c", "llm_his_t",
+    # "expert", "expert_his_c", "expert_his_t".
+    effort_type: str = "none"
+    effort_key: str = "observation.force"
+    effort_dim: int = 6
+    effort_history_steps: int = 4
+    train_effort_proj: bool = True
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
@@ -114,6 +124,24 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        valid_effort_types = {
+            "none",
+            "no",
+            "state",
+            "llm",
+            "llm_his_c",
+            "llm_his_t",
+            "expert",
+            "expert_his_c",
+            "expert_his_t",
+        }
+        self.effort_type = self.effort_type.lower()
+        if self.effort_type not in valid_effort_types:
+            raise ValueError(f"`effort_type` must be one of {sorted(valid_effort_types)}, got {self.effort_type}.")
+        if self.effort_history_steps < 1:
+            raise ValueError("`effort_history_steps` must be >= 1.")
+        if self.effort_dim < 1:
+            raise ValueError("`effort_dim` must be >= 1.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
@@ -123,6 +151,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 shape=(3, 480, 640),
             )
             self.input_features[key] = empty_camera
+        if self.effort_type not in {"none", "no"} and self.effort_key not in self.input_features:
+            self.input_features[self.effort_key] = PolicyFeature(
+                type=FeatureType.STATE,
+                shape=(self.effort_dim,),
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
