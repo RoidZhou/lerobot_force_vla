@@ -54,28 +54,25 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 import math
 from collections import deque
-from typing import TypedDict, Unpack
+from typing import Any, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.rtc.modeling_rtc import RTCProcessor
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
-from lerobot.policies.tactile.encoder import TactileTokenEncoder
-from lerobot.policies.utils import (
+from lerobot.common.constants import ACTION, OBS_STATE
+from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.common.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.common.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+from lerobot.common.policies.tactile.encoder import TactileTokenEncoder
+from lerobot.common.policies.utils import (
     populate_queues,
 )
-from lerobot.utils.constants import (
-    ACTION,
-    OBS_LANGUAGE_ATTENTION_MASK,
-    OBS_LANGUAGE_TOKENS,
-    OBS_STATE,
-    OBS_TACTILE,
-)
-from lerobot.utils.device_utils import get_safe_dtype
+from lerobot.common.utils.utils import get_safe_dtype
+
+OBS_LANGUAGE_TOKENS = "observation.language_tokens"
+OBS_LANGUAGE_ATTENTION_MASK = "observation.language_attention_mask"
+OBS_TACTILE = "observation.tactile"
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -265,7 +262,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Lets create processor if the config provided
         # If RTC is not enabled - we still can track the denoising data
         if self.config.rtc_config is not None:
-            self.rtc_processor = RTCProcessor(self.config.rtc_config)
+            raise NotImplementedError("RTC is not available in this LeRobot installation.")
 
             # In case of calling init_rtc_processor after the model is created
             # We need to set the rtc_processor to the model
@@ -489,11 +486,29 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def _extract_tactile_data(self, batch: dict[str, Tensor]) -> list[Tensor] | None:
-        """Extract tactile sensor data from the batch as a list of (B, H, W) tensors."""
+        """Extract Tac3D tactile tensors as a list of current-frame sensor readings."""
         if not self.config.use_tactile:
             return None
         tactile_keys = self.config.tactile_features if self.config.tactile_features else [OBS_TACTILE]
-        return [batch[k] for k in tactile_keys if k in batch] or None
+        tactile_data = [self._prepare_tactile_tensor(batch[k]) for k in tactile_keys if k in batch]
+        if len(tactile_data) == 0:
+            raise ValueError(
+                f"`use_tactile=True` but none of the tactile keys were found in the batch: {tactile_keys}."
+            )
+        return tactile_data
+
+    def _prepare_tactile_tensor(self, tactile: Tensor) -> Tensor:
+        """Use the latest Tac3D frame and keep the sensor-specific shape for the encoder."""
+        raw_ndim = len(self.config.tactile_raw_shape)
+        if tactile.ndim == raw_ndim + 2:
+            tactile = tactile[:, -1]
+        if tactile.ndim != raw_ndim + 1:
+            raise ValueError(
+                "Tac3D tactile tensors must have shape "
+                f"(B, *{self.config.tactile_raw_shape}) or (B, T, *{self.config.tactile_raw_shape}); "
+                f"got {tactile.shape}."
+            )
+        return tactile
 
     def prepare_state(self, batch):
         """Pad state"""
@@ -578,7 +593,7 @@ class VLAFlowMatching(nn.Module):
     └──────────────────────────────┘
     """
 
-    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, config: SmolVLAConfig, rtc_processor: Any | None = None):
         super().__init__()
         self.config = config
 
@@ -603,6 +618,8 @@ class VLAFlowMatching(nn.Module):
             self.tactile_encoder = TactileTokenEncoder(
                 encoder_type=config.tactile_encoder_type,
                 input_shape=config.tactile_input_shape,
+                input_channels=config.tactile_input_channels,
+                raw_shape=config.tactile_raw_shape,
                 feature_dim=config.tactile_feature_dim,
                 n_tokens=config.n_tactile_tokens,
                 dropout=config.tactile_dropout,
