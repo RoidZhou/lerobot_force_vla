@@ -51,6 +51,18 @@ class SmolVLAConfig(PreTrainedConfig):
     effort_dim: int = 6
     effort_history_steps: int = 4
     train_effort_proj: bool = True
+    effort_tokenizer: str = "raw"
+    force_vqvae_ckpt: str = ""
+    force_vqvae_window: int = 16
+    train_force_code_embedder: bool = True
+
+    # T-Rex-style high-frequency force refinement.
+    # When enabled, the slow SmolVLA call denoises only the first `force_refine_split_step`
+    # Euler steps and caches the partially denoised action chunk. Later calls can use fresh force
+    # readings to continue the remaining denoising steps and replace the not-yet-executed actions.
+    force_refine_enabled: bool = False
+    force_refine_split_step: int = 6
+    force_refine_loss_weight: float = 1.0
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -136,12 +148,38 @@ class SmolVLAConfig(PreTrainedConfig):
             "expert_his_t",
         }
         self.effort_type = self.effort_type.lower()
+        self.effort_tokenizer = self.effort_tokenizer.lower()
         if self.effort_type not in valid_effort_types:
             raise ValueError(f"`effort_type` must be one of {sorted(valid_effort_types)}, got {self.effort_type}.")
+        if self.effort_tokenizer not in {"raw", "force_vqvae"}:
+            raise ValueError("`effort_tokenizer` must be one of ['raw', 'force_vqvae'].")
         if self.effort_history_steps < 1:
             raise ValueError("`effort_history_steps` must be >= 1.")
         if self.effort_dim < 1:
             raise ValueError("`effort_dim` must be >= 1.")
+        if self.force_vqvae_window < 1:
+            raise ValueError("`force_vqvae_window` must be >= 1.")
+        if self.effort_tokenizer == "force_vqvae":
+            if self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+                raise ValueError(
+                    "`effort_tokenizer='force_vqvae'` requires a suffix force mode: "
+                    "`expert`, `expert_his_c`, or `expert_his_t`."
+                )
+            if not self.force_vqvae_ckpt:
+                raise ValueError("`force_vqvae_ckpt` must be set when `effort_tokenizer='force_vqvae'`.")
+        if self.force_refine_loss_weight < 0:
+            raise ValueError("`force_refine_loss_weight` must be >= 0.")
+        if self.force_refine_enabled:
+            if self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+                raise ValueError(
+                    "`force_refine_enabled=True` requires a suffix force mode: "
+                    "`expert`, `expert_his_c`, or `expert_his_t`."
+                )
+            if not (0 < self.force_refine_split_step < self.num_steps):
+                raise ValueError(
+                    "`force_refine_split_step` must be in (0, num_steps). "
+                    f"Got {self.force_refine_split_step=} and {self.num_steps=}."
+                )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
@@ -151,11 +189,15 @@ class SmolVLAConfig(PreTrainedConfig):
                 shape=(3, 480, 640),
             )
             self.input_features[key] = empty_camera
-        if self.effort_type not in {"none", "no"} and self.effort_key not in self.input_features:
-            self.input_features[self.effort_key] = PolicyFeature(
-                type=FeatureType.STATE,
-                shape=(self.effort_dim,),
-            )
+        if self.effort_type not in {"none", "no"}:
+            effort_feature_type = FeatureType.ENV if self.effort_tokenizer == "force_vqvae" else FeatureType.STATE
+            if self.effort_key in self.input_features:
+                self.input_features[self.effort_key].type = effort_feature_type
+            else:
+                self.input_features[self.effort_key] = PolicyFeature(
+                    type=effort_feature_type,
+                    shape=(self.effort_dim,),
+                )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

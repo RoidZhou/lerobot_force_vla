@@ -52,11 +52,17 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
+    effort_key = getattr(cfg, "effort_key", None)
+    use_force_vqvae = getattr(cfg, "effort_tokenizer", "raw") == "force_vqvae"
     for key in ds_meta.features:
         if key == "next.reward" and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == "action" and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
+        if use_force_vqvae and key == effort_key:
+            force_delta_indices = list(range(1 - cfg.force_vqvae_window, 1))
+            delta_timestamps[key] = [i / ds_meta.fps for i in force_delta_indices]
+            continue
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
