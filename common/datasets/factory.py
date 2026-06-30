@@ -72,6 +72,27 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
+def resolve_policy_effort_key(cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata) -> str | None:
+    effort_key = getattr(cfg, "effort_key", None)
+    if effort_key is None:
+        return None
+
+    candidates = [
+        effort_key,
+        f"observation.{effort_key}",
+        effort_key.replace("observation.", ""),
+        "observation.force_torque",
+        "force_torque",
+        "observation.force",
+        "force",
+        "effort",
+    ]
+    for candidate in candidates:
+        if candidate in ds_meta.features:
+            return candidate
+    return effort_key
+
+
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
@@ -92,6 +113,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+        resolved_effort_key = resolve_policy_effort_key(cfg.policy, ds_meta)
+        if resolved_effort_key is not None and hasattr(cfg.policy, "effort_key"):
+            cfg.policy.effort_key = resolved_effort_key
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
