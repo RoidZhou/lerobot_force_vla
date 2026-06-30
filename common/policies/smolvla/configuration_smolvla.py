@@ -14,14 +14,15 @@
 
 from dataclasses import dataclass, field
 
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
-from lerobot.optim.optimizers import AdamWConfig
-from lerobot.optim.schedulers import (
+from typing import Any
+
+from lerobot.common.constants import OBS_IMAGES
+from lerobot.common.optim.optimizers import AdamWConfig
+from lerobot.common.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
 )
-from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.utils.constants import OBS_IMAGES
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 
 
 @PreTrainedConfig.register_subclass("smolvla")
@@ -40,7 +41,6 @@ class SmolVLAConfig(PreTrainedConfig):
             "VISUAL": NormalizationMode.IDENTITY,
             "STATE": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.MEAN_STD,
-            "TACTILE": NormalizationMode.MEAN_STD,
         }
     )
 
@@ -108,18 +108,22 @@ class SmolVLAConfig(PreTrainedConfig):
     max_period: float = 4.0
 
     # Real-Time Chunking (RTC) configuration
-    rtc_config: RTCConfig | None = None
+    rtc_config: Any | None = None
 
     # Tactile sensor configuration
     use_tactile: bool = False
-    tactile_encoder_type: str = "cnn"  # choices: ["cnn", "attention"]
-    tactile_input_shape: tuple[int, int] = (12, 32)
+    tactile_encoder_type: str = "tac3d_cnn"  # choices: ["tac3d_cnn", "tac3d_attention", "mlp"]
+    tactile_input_shape: tuple[int, int] = (20, 20)
+    tactile_input_channels: int = 3
+    tactile_raw_shape: tuple[int, int] = (400, 3)
     tactile_dropout: float = 0.3
-    tactile_feature_dim: int = 256  # internal CNN output dim before projection to VLM hidden size
-    # Named tactile sensor keys when using multiple sensors.
-    # e.g., ["observation.tactile.left", "observation.tactile.right"]
-    # Leave as None for single sensor mode (uses "observation.tactile" key).
-    tactile_features: list[str] | None = None
+    tactile_feature_dim: int = 256
+    tactile_features: list[str] | None = field(
+        default_factory=lambda: [
+            "observation.tactile_left.distributed_force",
+            "observation.tactile_right.distributed_force",
+        ]
+    )
     # Number of prefix tokens each tactile sensor is encoded into.
     n_tactile_tokens: int = 1
 
@@ -142,10 +146,15 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
-        if self.use_tactile and self.tactile_encoder_type not in ["cnn", "attention"]:
+        if self.use_tactile and self.tactile_encoder_type not in ["tac3d_cnn", "tac3d_attention", "mlp"]:
             raise ValueError(
                 f"Invalid tactile encoder type. Got {self.tactile_encoder_type}, "
-                f"expected one of ['cnn', 'attention']"
+                f"expected one of ['tac3d_cnn', 'tac3d_attention', 'mlp']"
+            )
+        if self.use_tactile and self.tactile_input_shape[0] * self.tactile_input_shape[1] != self.tactile_raw_shape[0]:
+            raise ValueError(
+                "`tactile_input_shape` must contain exactly `tactile_raw_shape[0]` taxels. "
+                f"Got {self.tactile_input_shape=} and {self.tactile_raw_shape=}."
             )
 
     def validate_features(self) -> None:
