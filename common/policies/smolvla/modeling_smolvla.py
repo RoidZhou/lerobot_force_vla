@@ -281,10 +281,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
         if self.config.effort_type.endswith("_his_c") or self.config.effort_type.endswith("_his_t"):
-            self._queues[self.config.effort_key] = deque(maxlen=self.config.effort_history_steps)
+            effort_queue_len = (
+                self.config.force_vqvae_window
+                if self.config.effort_tokenizer == "force_vqvae"
+                else self.config.effort_history_steps
+            )
+            self._queues[self.config.effort_key] = deque(maxlen=effort_queue_len)
             for effort_key in (OBS_EFFORT, "effort", "force"):
                 if effort_key != self.config.effort_key:
-                    self._queues[effort_key] = deque(maxlen=self.config.effort_history_steps)
+                    self._queues[effort_key] = deque(maxlen=effort_queue_len)
         self._force_refine_state = None
 
     def get_optim_params(self) -> dict:
