@@ -53,6 +53,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 """
 
 import math
+import copy
 from collections import deque
 from pathlib import Path
 
@@ -661,6 +662,10 @@ class VLAFlowMatching(nn.Module):
         )
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        if self.config.force_expert_enabled:
+            self.force_expert = copy.deepcopy(self.vlm_with_expert.lm_expert)
+        else:
+            self.force_expert = None
         if self.config.force_refine_enabled:
             self.force_refine_out_proj = nn.Linear(
                 self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim
@@ -742,6 +747,9 @@ class VLAFlowMatching(nn.Module):
         if self.force_code_embedder is not None:
             for params in self.force_code_embedder.parameters():
                 params.requires_grad = self.config.train_force_code_embedder
+        if self.force_expert is not None:
+            for params in self.force_expert.parameters():
+                params.requires_grad = self.config.train_force_expert
 
     def _load_force_vqvae(self) -> tuple[ForceVQVAEConfig, dict]:
         ckpt_path = Path(self.config.force_vqvae_ckpt).expanduser()
@@ -1010,7 +1018,7 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state, effort=effort
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, effort=effort)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, effort=None)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -1078,6 +1086,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
+            expert_model=self.force_expert,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -1119,7 +1128,7 @@ class VLAFlowMatching(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
-                effort,
+                effort=None,
             )
             # Euler step
             x_t += dt * v_t
@@ -1159,7 +1168,7 @@ class VLAFlowMatching(nn.Module):
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         for _ in range(self.config.force_refine_split_step):
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(prefix_pad_masks, past_key_values, x_t, expanded_time, effort)
+            v_t = self.denoise_step(prefix_pad_masks, past_key_values, x_t, expanded_time, effort=None)
             x_t += dt * v_t
             time += dt
 
@@ -1229,6 +1238,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
+            expert_model=self.force_expert if force_refine else None,
         )
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]

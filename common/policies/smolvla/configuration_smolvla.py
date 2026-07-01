@@ -63,6 +63,8 @@ class SmolVLAConfig(PreTrainedConfig):
     force_refine_enabled: bool = False
     force_refine_split_step: int = 6
     force_refine_loss_weight: float = 1.0
+    force_expert_enabled: bool = False
+    train_force_expert: bool = True
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -169,6 +171,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("`force_vqvae_ckpt` must be set when `effort_tokenizer='force_vqvae'`.")
         if self.force_refine_loss_weight < 0:
             raise ValueError("`force_refine_loss_weight` must be >= 0.")
+        if self.force_expert_enabled and not self.force_refine_enabled:
+            raise ValueError("`force_expert_enabled=True` requires `force_refine_enabled=True`.")
         if self.force_refine_enabled:
             if self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
                 raise ValueError(
