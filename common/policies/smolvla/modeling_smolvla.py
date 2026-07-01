@@ -928,7 +928,7 @@ class VLAFlowMatching(nn.Module):
         if mode == "suffix" and self.effort_type not in suffix_effort_types:
             return embs, pad_masks, att_masks
         if effort is None:
-            raise ValueError(f"`effort_type={self.effort_type}` requires an effort tensor.")
+            return embs, pad_masks, att_masks
         if self.effort_tokenizer == "force_vqvae":
             return self._process_force_code_tokens(effort, mode)
 
