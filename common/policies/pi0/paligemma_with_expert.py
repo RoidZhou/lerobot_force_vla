@@ -234,8 +234,10 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         inputs_embeds: List[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         fill_kv_cache: Optional[bool] = None,
+        expert_model: Optional[GemmaForCausalLM] = None,
     ):
-        models = [self.paligemma.language_model.model, self.gemma_expert.model]
+        gemma_expert = self.gemma_expert if expert_model is None else expert_model
+        models = [self.paligemma.language_model.model, gemma_expert.model]
 
         for hidden_states in inputs_embeds:
             # TODO this is very inefficient

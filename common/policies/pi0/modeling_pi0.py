@@ -50,14 +50,16 @@ policy = Pi0Policy.from_pretrained("lerobot/pi0")
 """
 
 import math
+import copy
 from collections import deque
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from transformers import AutoTokenizer
 
-from lerobot.common.constants import ACTION, OBS_STATE
+from lerobot.common.constants import ACTION, OBS_EFFORT, OBS_STATE
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.common.policies.pi0.paligemma_with_expert import (
@@ -65,7 +67,9 @@ from lerobot.common.policies.pi0.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.common.policies.utils import populate_queues
 from lerobot.common.utils.utils import get_safe_dtype
+from lerobot.force_vqvae.models import ForceVQVAE, ForceVQVAEConfig
 
 
 def create_sinusoidal_pos_embedding(
@@ -164,6 +168,21 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
+def pad_sequence(vector, new_len):
+    """Pads or trims the sequence dimension to keep the most recent values."""
+    if vector.shape[1] == new_len:
+        return vector
+    if vector.shape[1] > new_len:
+        return vector[:, -new_len:, :]
+
+    shape = list(vector.shape)
+    current_len = shape[1]
+    shape[1] = new_len
+    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
+    new_vector[:, -current_len:, :] = vector
+    return new_vector
+
+
 def normalize(x, min_val, max_val):
     return (x - min_val) / (max_val - min_val)
 
@@ -255,10 +274,40 @@ class PI0Policy(PreTrainedPolicy):
 
     def reset(self):
         """This should be called whenever the environment is reset."""
-        self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._queues = {
+            ACTION: deque([], maxlen=self.config.n_action_steps),
+        }
+        self._action_queue = self._queues[ACTION]
+        if self.config.effort_type.endswith("_his_c") or self.config.effort_type.endswith("_his_t"):
+            effort_queue_len = (
+                self.config.force_vqvae_window
+                if self.config.effort_tokenizer == "force_vqvae"
+                else self.config.effort_history_steps
+            )
+            self._queues[self.config.effort_key] = deque(maxlen=effort_queue_len)
+            for effort_key in (OBS_EFFORT, "effort", "force"):
+                if effort_key != self.config.effort_key:
+                    self._queues[effort_key] = deque(maxlen=effort_queue_len)
+        self._force_refine_state = None
 
     def get_optim_params(self) -> dict:
         return self.parameters()
+
+    def _raw_effort_for_tokenizer(self, batch: dict[str, Tensor]) -> tuple[str, Tensor] | None:
+        if self.config.effort_tokenizer != "force_vqvae":
+            return None
+        for candidate_key in (self.config.effort_key, "force", OBS_EFFORT, "effort"):
+            if candidate_key in batch:
+                return candidate_key, batch[candidate_key].clone()
+        return None
+
+    def _restore_raw_effort_for_tokenizer(
+        self, batch: dict[str, Tensor], raw_effort: tuple[str, Tensor] | None
+    ) -> None:
+        if raw_effort is None:
+            return
+        effort_key, effort = raw_effort
+        batch[effort_key] = effort
 
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -273,18 +322,30 @@ class PI0Policy(PreTrainedPolicy):
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
 
+        raw_effort = self._raw_effort_for_tokenizer(batch)
         batch = self.normalize_inputs(batch)
+        self._restore_raw_effort_for_tokenizer(batch, raw_effort)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
-        if len(self._action_queue) == 0:
+        if len(self._queues[ACTION]) == 0:
+            for k in batch:
+                if k in self._queues:
+                    batch[k] = torch.stack(list(self._queues[k]), dim=1)
             images, img_masks = self.prepare_images(batch)
             state = self.prepare_state(batch)
+            effort = self.prepare_effort(batch)
             lang_tokens, lang_masks = self.prepare_language(batch)
 
-            actions = self.model.sample_actions(
-                images, img_masks, lang_tokens, lang_masks, state, noise=noise
-            )
+            if self.config.force_refine_enabled:
+                actions, self._force_refine_state = self.model.sample_actions_for_force_refine(
+                    images, img_masks, lang_tokens, lang_masks, state, effort=effort, noise=noise
+                )
+            else:
+                actions = self.model.sample_actions(
+                    images, img_masks, lang_tokens, lang_masks, state, effort=effort, noise=noise
+                )
 
             # Unpad actions
             original_action_dim = self.config.action_feature.shape[0]
@@ -297,8 +358,44 @@ class PI0Policy(PreTrainedPolicy):
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+            self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+        return self._queues[ACTION].popleft()
+
+    @torch.no_grad
+    def refine_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """Refine the not-yet-executed actions in the current chunk with fresh high-rate force readings."""
+        if not self.config.force_refine_enabled:
+            raise RuntimeError("`refine_action_chunk` requires `policy.force_refine_enabled=True`.")
+        if self._force_refine_state is None:
+            raise RuntimeError("No force-refine cache is available. Call `select_action` once to start a chunk.")
+        if len(self._queues[ACTION]) == 0:
+            raise RuntimeError("No queued actions remain to refine.")
+
+        self.eval()
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+        raw_effort = self._raw_effort_for_tokenizer(batch)
+        batch = self.normalize_inputs(batch)
+        self._restore_raw_effort_for_tokenizer(batch, raw_effort)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        for k in batch:
+            if k in self._queues and k != ACTION:
+                batch[k] = torch.stack(list(self._queues[k]), dim=1)
+
+        effort = self.prepare_effort(batch)
+        refined_actions = self.model.refine_actions_from_force(self._force_refine_state, effort=effort)
+
+        original_action_dim = self.config.action_feature.shape[0]
+        refined_actions = refined_actions[:, :, :original_action_dim]
+        refined_actions = self.unnormalize_outputs({"action": refined_actions})["action"]
+        if self.config.adapt_to_pi_aloha:
+            refined_actions = self._pi_aloha_encode_actions(refined_actions)
+
+        executed_steps = self.config.n_action_steps - len(self._queues[ACTION])
+        remaining_actions = refined_actions[:, executed_steps : self.config.n_action_steps]
+        self._queues[ACTION].clear()
+        self._queues[ACTION].extend(remaining_actions.transpose(0, 1))
+        return remaining_actions
 
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> tuple[Tensor, dict[str, Tensor]]:
         """Do a full training forward pass to compute the loss"""
@@ -306,32 +403,56 @@ class PI0Policy(PreTrainedPolicy):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
+        raw_effort = self._raw_effort_for_tokenizer(batch)
         batch = self.normalize_inputs(batch)
+        self._restore_raw_effort_for_tokenizer(batch, raw_effort)
         batch = self.normalize_targets(batch)
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
+        effort = self.prepare_effort(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
 
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        model_losses = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, effort, noise, time
+        )
+        if isinstance(model_losses, tuple):
+            losses, force_refine_losses = model_losses
+        else:
+            losses = model_losses
+            force_refine_losses = None
         loss_dict["losses_after_forward"] = losses.clone()
+        if force_refine_losses is not None:
+            loss_dict["force_refine_losses_after_forward"] = force_refine_losses.clone()
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
             loss_dict["losses_after_in_ep_bound"] = losses.clone()
+            if force_refine_losses is not None:
+                force_refine_losses = force_refine_losses * in_episode_bound.unsqueeze(-1)
+                loss_dict["force_refine_losses_after_in_ep_bound"] = force_refine_losses.clone()
 
         # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone()
+        if force_refine_losses is not None:
+            force_refine_losses = force_refine_losses[:, :, : self.config.max_action_dim]
+            loss_dict["force_refine_losses_after_rm_padding"] = force_refine_losses.clone()
 
         # For backward pass
-        loss = losses.mean()
-        # For logging
-        loss_dict["l2_loss"] = loss.item()
+        action_loss = losses.mean()
+        loss_dict["action_loss"] = action_loss.item()
+        loss = action_loss
+        if force_refine_losses is not None:
+            force_refine_loss = force_refine_losses.mean()
+            loss_dict["force_refine_loss"] = force_refine_loss.item()
+            loss = loss + self.config.force_refine_loss_weight * force_refine_loss
+        loss_dict["l2_loss"] = action_loss.item()
+        loss_dict["loss"] = loss.item()
 
         return loss, loss_dict
 
@@ -427,8 +548,45 @@ class PI0Policy(PreTrainedPolicy):
 
     def prepare_state(self, batch):
         """Pad state"""
-        state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
+        state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        if self.config.effort_type == "state":
+            effort = self.prepare_effort(batch)
+            state = torch.cat([state, effort[:, -1, :]], dim=-1)
+        state = pad_vector(state, self.config.max_state_dim)
         return state
+
+    def prepare_effort(self, batch):
+        """Prepare end-effector force/effort history as (batch_size, history, effort_dim)."""
+        if self.config.effort_type in {"none", "no"}:
+            return None
+
+        effort_key = None
+        for candidate_key in (self.config.effort_key, "force", OBS_EFFORT, "effort"):
+            if candidate_key in batch:
+                effort_key = candidate_key
+                break
+        if effort_key is None:
+            raise ValueError(
+                f"`effort_type={self.config.effort_type}` requires one of "
+                f"`{self.config.effort_key}`, `force`, `{OBS_EFFORT}`, or `effort` in the batch."
+            )
+
+        effort = batch[effort_key]
+        if effort.ndim == 2:
+            effort = effort[:, None, :]
+        elif effort.ndim != 3:
+            raise ValueError(f"Effort is expected to have shape (B, D) or (B, T, D), got {effort.shape}.")
+        effort_pad_key = f"{effort_key}_is_pad"
+        if effort_pad_key in batch:
+            effort = effort.masked_fill(batch[effort_pad_key].to(device=effort.device).unsqueeze(-1), 0.0)
+
+        effort = pad_vector(effort, self.config.effort_dim)
+        history_steps = self.config.effort_history_steps
+        if self.config.effort_tokenizer == "force_vqvae":
+            history_steps = self.config.force_vqvae_window
+        elif self.config.effort_type in {"llm", "expert", "state"}:
+            history_steps = 1
+        return pad_sequence(effort, history_steps)
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -466,6 +624,8 @@ class PI0FlowMatching(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.effort_type = self.config.effort_type
+        self.effort_tokenizer = self.config.effort_tokenizer
 
         paligemma_with_export_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
@@ -478,6 +638,51 @@ class PI0FlowMatching(nn.Module):
         self.state_proj = nn.Linear(self.config.max_state_dim, self.config.proj_width)
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
         self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
+        if self.config.force_expert_enabled:
+            self.force_expert = copy.deepcopy(self.paligemma_with_expert.gemma_expert)
+        else:
+            self.force_expert = None
+        if self.config.force_refine_enabled:
+            self.force_refine_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
+        else:
+            self.force_refine_out_proj = None
+        self.force_vqvae = None
+        self.force_code_embedder = None
+        if self.effort_tokenizer == "force_vqvae":
+            force_vqvae_cfg, force_vqvae_stats = self._load_force_vqvae()
+            self.force_vqvae_window = force_vqvae_cfg.window
+            self.config.force_vqvae_window = force_vqvae_cfg.window
+            if force_vqvae_cfg.force_dim != self.config.effort_dim:
+                raise ValueError(
+                    f"ForceVQVAE checkpoint expects force_dim={force_vqvae_cfg.force_dim}, "
+                    f"but `effort_dim={self.config.effort_dim}`."
+                )
+            self.force_code_embedder = nn.Embedding(force_vqvae_cfg.codebook_size, self.config.proj_width)
+            self.register_buffer(
+                "force_vqvae_min", torch.as_tensor(force_vqvae_stats["force_min"], dtype=torch.float32)
+            )
+            self.register_buffer(
+                "force_vqvae_max", torch.as_tensor(force_vqvae_stats["force_max"], dtype=torch.float32)
+            )
+            self.register_buffer(
+                "force_vqvae_mask", torch.as_tensor(force_vqvae_stats["force_mask"], dtype=torch.bool)
+            )
+        if self.effort_tokenizer == "raw" and self.effort_type in {"llm", "llm_his_c", "llm_his_t"}:
+            effort_in_dim = self.config.effort_dim * self.config.effort_history_steps
+            if self.effort_type == "llm_his_t":
+                effort_in_dim = self.config.effort_dim
+            prefix_hidden_size = self.paligemma_with_expert.paligemma.config.text_config.hidden_size
+            self.effort_proj_in = nn.Linear(effort_in_dim, 2 * prefix_hidden_size)
+            self.effort_proj_out = nn.Linear(2 * prefix_hidden_size, prefix_hidden_size)
+        elif self.effort_tokenizer == "raw" and self.effort_type in {"expert", "expert_his_c", "expert_his_t"}:
+            effort_in_dim = self.config.effort_dim * self.config.effort_history_steps
+            if self.effort_type == "expert_his_t":
+                effort_in_dim = self.config.effort_dim
+            self.effort_proj_in = nn.Linear(effort_in_dim, 2 * self.config.proj_width)
+            self.effort_proj_out = nn.Linear(2 * self.config.proj_width, self.config.proj_width)
+        else:
+            self.effort_proj_in = None
+            self.effort_proj_out = None
 
         self.action_time_mlp_in = nn.Linear(self.config.proj_width * 2, self.config.proj_width)
         self.action_time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
@@ -487,6 +692,30 @@ class PI0FlowMatching(nn.Module):
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
+        if self.effort_proj_in is not None:
+            for params in self.effort_proj_in.parameters():
+                params.requires_grad = self.config.train_effort_proj
+            for params in self.effort_proj_out.parameters():
+                params.requires_grad = self.config.train_effort_proj
+        if self.force_code_embedder is not None:
+            for params in self.force_code_embedder.parameters():
+                params.requires_grad = self.config.train_force_code_embedder
+        if self.force_expert is not None:
+            for params in self.force_expert.parameters():
+                params.requires_grad = self.config.train_force_expert
+
+    def _load_force_vqvae(self) -> tuple[ForceVQVAEConfig, dict]:
+        ckpt_path = Path(self.config.force_vqvae_ckpt).expanduser()
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"`force_vqvae_ckpt` does not exist: {ckpt_path}")
+        blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        force_vqvae_cfg = ForceVQVAEConfig.from_dict(blob["config"])
+        self.force_vqvae = ForceVQVAE(force_vqvae_cfg)
+        self.force_vqvae.load_state_dict(blob["model_state"])
+        self.force_vqvae.eval()
+        for param in self.force_vqvae.parameters():
+            param.requires_grad = False
+        return force_vqvae_cfg, blob["stats"]
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -504,7 +733,7 @@ class PI0FlowMatching(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, effort: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -548,6 +777,11 @@ class PI0FlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        effort_embs, effort_pad_masks, effort_att_masks = self._process_effort_tokens(effort, mode="prefix")
+        embs.extend(effort_embs)
+        pad_masks.extend(effort_pad_masks)
+        att_masks.extend(effort_att_masks)
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -555,7 +789,83 @@ class PI0FlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def _project_effort(self, effort: torch.Tensor) -> torch.Tensor:
+        effort_hidden = self.effort_proj_in(effort)
+        effort_hidden = F.silu(effort_hidden)
+        return self.effort_proj_out(effort_hidden)
+
+    def _normalize_force_for_vqvae(self, effort: torch.Tensor) -> torch.Tensor:
+        effort = effort.to(device=self.force_vqvae_min.device, dtype=torch.float32)
+        denom = (self.force_vqvae_max - self.force_vqvae_min) + 1e-8
+        normed = torch.clamp(2.0 * (effort - self.force_vqvae_min) / denom - 1.0, -1.0, 1.0)
+        return torch.where(self.force_vqvae_mask, normed, effort)
+
+    def _process_force_code_tokens(self, effort: torch.Tensor | None, mode: str):
+        embs = []
+        pad_masks = []
+        att_masks = []
+        suffix_effort_types = {"expert", "expert_his_c", "expert_his_t"}
+        if mode != "suffix" or self.effort_type not in suffix_effort_types:
+            return embs, pad_masks, att_masks
+        if effort is None:
+            return embs, pad_masks, att_masks
+        if self.force_vqvae is None or self.force_code_embedder is None:
+            raise RuntimeError("Force VQ-VAE tokenizer is not initialized.")
+
+        effort = pad_sequence(effort, self.force_vqvae_window)
+        force_normed = self._normalize_force_for_vqvae(effort)
+        with torch.no_grad():
+            self.force_vqvae.eval()
+            force_codes = self.force_vqvae.encode(force_normed).to(device=self.force_code_embedder.weight.device)
+        force_token = self.force_code_embedder(force_codes)[:, None, :]
+        bsize = effort.shape[0]
+        embs.append(force_token)
+        pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=force_token.device))
+        att_masks.append(True)
+        return embs, pad_masks, att_masks
+
+    def _process_effort_tokens(self, effort: torch.Tensor | None, mode: str):
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        if self.effort_type in {"none", "no", "state"}:
+            return embs, pad_masks, att_masks
+
+        prefix_effort_types = {"llm", "llm_his_c", "llm_his_t"}
+        suffix_effort_types = {"expert", "expert_his_c", "expert_his_t"}
+        if mode == "prefix" and self.effort_type not in prefix_effort_types:
+            return embs, pad_masks, att_masks
+        if mode == "suffix" and self.effort_type not in suffix_effort_types:
+            return embs, pad_masks, att_masks
+        if effort is None:
+            return embs, pad_masks, att_masks
+        if self.effort_tokenizer == "force_vqvae":
+            return self._process_force_code_tokens(effort, mode)
+
+        bsize = effort.shape[0]
+        device = effort.device
+        ar_mask_value = mode == "suffix"
+        if self.effort_type in {"llm", "expert"}:
+            effort_token = self._project_effort(effort[:, -1, :])[:, None, :]
+            embs.append(effort_token)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            att_masks.append(ar_mask_value)
+        elif self.effort_type in {"llm_his_c", "expert_his_c"}:
+            effort_token = self._project_effort(effort.reshape(bsize, -1))[:, None, :]
+            embs.append(effort_token)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            att_masks.append(ar_mask_value)
+        elif self.effort_type in {"llm_his_t", "expert_his_t"}:
+            for i in range(effort.shape[1]):
+                effort_token = self._project_effort(effort[:, i, :])[:, None, :]
+                embs.append(effort_token)
+                pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+                att_masks.append(ar_mask_value)
+
+        return embs, pad_masks, att_masks
+
+    def embed_suffix(self, state, noisy_actions, timestep, effort: torch.Tensor = None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -574,6 +884,11 @@ class PI0FlowMatching(nn.Module):
 
         # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1]
+
+        effort_embs, effort_pad_masks, effort_att_masks = self._process_effort_tokens(effort, mode="suffix")
+        embs.extend(effort_embs)
+        pad_masks.extend(effort_pad_masks)
+        att_masks.extend(effort_att_masks)
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
@@ -609,7 +924,7 @@ class PI0FlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, effort=None, noise=None, time=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -623,9 +938,9 @@ class PI0FlowMatching(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, effort=effort
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time, effort=None)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -647,9 +962,64 @@ class PI0FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
 
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        if not self.config.force_refine_enabled:
+            return losses
 
-    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> Tensor:
+        force_refine_losses = self.forward_force_refine(
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            state,
+            actions,
+            effort=effort,
+            noise=noise,
+        )
+        return losses, force_refine_losses
+
+    def forward_force_refine(
+        self,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        state,
+        actions,
+        effort=None,
+        noise=None,
+    ) -> Tensor:
+        """Train the force-refine head on the lower flow segment used by fast force updates."""
+        if self.force_refine_out_proj is None:
+            raise RuntimeError("`forward_force_refine` requires `force_refine_enabled=True`.")
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+
+        tau_split = 1.0 - self.config.force_refine_split_step / self.config.num_steps
+        time = self.sample_time(actions.shape[0], actions.device) * tau_split
+        time = torch.clamp(time, min=0.001)
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time, effort=effort)
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+            expert_model=self.force_expert,
+        )
+        suffix_out = suffix_out[:, -self.config.n_action_steps :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        force_v_t = self.force_refine_out_proj(suffix_out)
+        return F.mse_loss(u_t, force_v_t, reduction="none")
+
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, effort=None, noise=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
         device = state.device
@@ -659,7 +1029,7 @@ class PI0FlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, effort=effort
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -687,9 +1057,82 @@ class PI0FlowMatching(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
+                effort=None,
             )
 
             # Euler step
+            x_t += dt * v_t
+            time += dt
+        return x_t
+
+    def sample_actions_for_force_refine(
+        self, images, img_masks, lang_tokens, lang_masks, state, effort=None, noise=None
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Run the slow split stage and immediately refine once with the current force."""
+        bsize = state.shape[0]
+        device = state.device
+
+        if noise is None:
+            actions_shape = (bsize, self.config.n_action_steps, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, effort=effort
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+
+        dt = torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32, device=device)
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        for _ in range(self.config.force_refine_split_step):
+            expanded_time = time.expand(bsize)
+            v_t = self.denoise_step(state, prefix_pad_masks, past_key_values, x_t, expanded_time, effort=None)
+            x_t += dt * v_t
+            time += dt
+
+        refine_state = {
+            "state": state,
+            "prefix_pad_masks": prefix_pad_masks,
+            "past_key_values": past_key_values,
+            "x_split": x_t.detach(),
+            "tau_split": time.detach(),
+        }
+        actions = self.refine_actions_from_force(refine_state, effort=effort)
+        return actions, refine_state
+
+    def refine_actions_from_force(self, refine_state: dict[str, Tensor], effort=None) -> Tensor:
+        """Continue the lower flow segment from cached x_split using a fresh force condition."""
+        state = refine_state["state"]
+        prefix_pad_masks = refine_state["prefix_pad_masks"]
+        past_key_values = refine_state["past_key_values"]
+        x_t = refine_state["x_split"].clone()
+        time = refine_state["tau_split"].clone()
+
+        bsize = x_t.shape[0]
+        device = x_t.device
+        dt = torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32, device=device)
+        remaining_steps = self.config.num_steps - self.config.force_refine_split_step
+        for _ in range(remaining_steps):
+            expanded_time = time.expand(bsize)
+            v_t = self.denoise_step(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                expanded_time,
+                effort,
+                force_refine=True,
+            )
             x_t += dt * v_t
             time += dt
         return x_t
@@ -701,9 +1144,15 @@ class PI0FlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        effort=None,
+        force_refine: bool = False,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, timestep)
+        if force_refine and self.force_refine_out_proj is None:
+            raise RuntimeError("Force refinement requires `force_refine_enabled=True`.")
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            state, x_t, timestep, effort=effort
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -724,9 +1173,11 @@ class PI0FlowMatching(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
+            expert_model=self.force_expert if force_refine else None,
         )
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.n_action_steps :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
+        out_proj = self.force_refine_out_proj if force_refine else self.action_out_proj
+        v_t = out_proj(suffix_out)
         return v_t
