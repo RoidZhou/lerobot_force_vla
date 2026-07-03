@@ -267,7 +267,9 @@ class PI0Policy(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained(self.config.vlm_model_name)
+        self.language_tokenizer = AutoTokenizer.from_pretrained(
+            getattr(self.config, "vlm_model_name", "google/paligemma-3b-pt-224")
+        )
         self.model = PI0FlowMatching(config)
 
         self.reset()

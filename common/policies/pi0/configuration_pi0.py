@@ -59,6 +59,7 @@ class PI0Config(PreTrainedConfig):
 
     # Tokenizer
     tokenizer_max_length: int = 48
+    vlm_model_name: str = "google/paligemma-3b-pt-224"
 
     # Projector
     proj_width: int = 1024
