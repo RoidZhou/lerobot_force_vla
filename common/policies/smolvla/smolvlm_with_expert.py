@@ -265,6 +265,8 @@ class SmolVLMWithExpertModel(nn.Module):
                 key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
                 value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
 
+        attention_mask_ = attention_mask_[:, : query_states.shape[1], : key_states.shape[1]]
+
         attention_interface = self.get_attention_interface()
 
         att_output = attention_interface(
