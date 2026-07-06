@@ -1129,13 +1129,33 @@ class VLAFlowMatching(nn.Module):
         action_context_att_2d_masks = make_att_2d_masks(action_context_pad_masks, action_context_att_masks)
         action_context_position_ids = torch.cumsum(action_context_pad_masks, dim=1) - 1
 
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         _, action_context_cache = self.vlm_with_expert.forward(
-            attention_mask=action_context_att_2d_masks,
-            position_ids=action_context_position_ids,
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, action_suffix_embs],
+            inputs_embeds=[prefix_embs, None],
             use_cache=True,
             fill_kv_cache=True,
+        )
+
+        action_len = action_suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, action_len, prefix_len)
+        action_att_2d_masks = make_att_2d_masks(action_suffix_pad_masks, action_suffix_att_masks)
+        action_step_att_2d_masks = torch.cat([prefix_pad_2d_masks, action_att_2d_masks], dim=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        action_position_ids = prefix_offsets + torch.cumsum(action_suffix_pad_masks, dim=1) - 1
+
+        _, action_context_cache = self.vlm_with_expert.forward(
+            attention_mask=action_step_att_2d_masks,
+            position_ids=action_position_ids,
+            past_key_values=action_context_cache,
+            inputs_embeds=[None, action_suffix_embs],
+            use_cache=True,
+            fill_kv_cache=False,
         )
         return action_context_cache, action_context_pad_masks
 
