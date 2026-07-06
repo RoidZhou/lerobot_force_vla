@@ -410,9 +410,15 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: Optional[bool] = None,
         fill_kv_cache: Optional[bool] = None,
         expert_model: Optional[nn.Module] = None,
+        shared_inputs_embeds: Optional[List[torch.FloatTensor]] = None,
+        shared_attention: Optional[nn.Module] = None,
+        shared_attention_mask: Optional[torch.Tensor] = None,
+        shared_position_ids: Optional[torch.LongTensor] = None,
     ):
         models = [self.get_vlm_model().text_model, expert_model if expert_model is not None else self.lm_expert]
+        shared_models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
+        shared_model_layers = self.get_model_layers(shared_models)
         for hidden_states in inputs_embeds:
             # TODO this is very inefficient
             # dtype is always the same, batch size too (if > 1 len)
@@ -488,6 +494,76 @@ class SmolVLMWithExpertModel(nn.Module):
                     outputs_embeds.append(None)
 
             inputs_embeds = outputs_embeds
+            if shared_attention is not None and shared_inputs_embeds is not None:
+                shared_att_mask = shared_attention_mask if shared_attention_mask is not None else attention_mask
+                shared_pos_ids = shared_position_ids if shared_position_ids is not None else position_ids
+                if (
+                    fill_kv_cache
+                    or "cross" not in self.attention_mode
+                    or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
+                ):
+                    shared_att_outputs, _ = self.forward_attn_layer(
+                        shared_model_layers,
+                        shared_inputs_embeds,
+                        layer_idx,
+                        shared_pos_ids,
+                        shared_att_mask,
+                        batch_size,
+                        head_dim,
+                        use_cache=use_cache,
+                        fill_kv_cache=fill_kv_cache,
+                        past_key_values=past_key_values,
+                    )
+                else:
+                    shared_att_outputs, _ = self.forward_cross_attn_layer(
+                        shared_model_layers,
+                        shared_inputs_embeds,
+                        layer_idx,
+                        shared_pos_ids,
+                        shared_att_mask,
+                        batch_size,
+                        head_dim,
+                        use_cache=use_cache,
+                        fill_kv_cache=fill_kv_cache,
+                        past_key_values=past_key_values,
+                    )
+                shared_outputs_embeds = []
+                start = 0
+                for i, hidden_states in enumerate(shared_inputs_embeds):
+                    layer = shared_model_layers[i][layer_idx]
+                    att_output = shared_att_outputs[i] if i < len(shared_att_outputs) else shared_att_outputs[0]
+                    if hidden_states is not None:
+                        if layer is None:
+                            shared_outputs_embeds.append(hidden_states)
+                            continue
+                        end = start + hidden_states.shape[1]
+
+                        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                        att_out = att_output[:, start:end]
+                        out_emb = layer.self_attn.o_proj(att_out)
+
+                        out_emb += hidden_states
+                        after_first_residual = out_emb.clone()
+
+                        out_emb = layer.post_attention_layernorm(out_emb)
+                        out_emb = layer.mlp(out_emb)
+
+                        out_emb += after_first_residual
+
+                        shared_outputs_embeds.append(out_emb)
+
+                        start = end if len(shared_att_outputs) == 1 else 0
+                    else:
+                        shared_outputs_embeds.append(None)
+
+                if inputs_embeds[1] is not None and shared_outputs_embeds[1] is not None:
+                    shared_expert, force_expert = shared_attention.forward_layer(
+                        shared_outputs_embeds[1], inputs_embeds[1], layer_idx
+                    )
+                    shared_outputs_embeds[1] = shared_expert
+                    inputs_embeds[1] = force_expert
+                shared_inputs_embeds = shared_outputs_embeds
 
         # final norm
         outputs_embeds = []

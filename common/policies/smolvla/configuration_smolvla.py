@@ -65,6 +65,11 @@ class SmolVLAConfig(PreTrainedConfig):
     force_refine_loss_weight: float = 1.0
     force_expert_enabled: bool = False
     train_force_expert: bool = True
+    force_shared_attention_enabled: bool = False
+    force_shared_attention_layers: int = 2
+    force_shared_attention_heads: int = 8
+    force_shared_attention_dropout: float = 0.0
+    train_force_shared_attention: bool = True
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -173,6 +178,16 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("`force_refine_loss_weight` must be >= 0.")
         if self.force_expert_enabled and not self.force_refine_enabled:
             raise ValueError("`force_expert_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_shared_attention_enabled and not self.force_refine_enabled:
+            raise ValueError("`force_shared_attention_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_shared_attention_enabled and not self.force_expert_enabled:
+            raise ValueError("`force_shared_attention_enabled=True` requires `force_expert_enabled=True`.")
+        if self.force_shared_attention_layers < 1:
+            raise ValueError("`force_shared_attention_layers` must be >= 1.")
+        if self.force_shared_attention_heads < 1:
+            raise ValueError("`force_shared_attention_heads` must be >= 1.")
+        if self.force_shared_attention_dropout < 0:
+            raise ValueError("`force_shared_attention_dropout` must be >= 0.")
         if self.force_refine_enabled:
             if self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
                 raise ValueError(

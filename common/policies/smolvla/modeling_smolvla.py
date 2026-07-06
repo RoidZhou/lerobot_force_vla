@@ -614,6 +614,45 @@ def pad_tensor(tensor, max_len, pad_value=0):
     return padded_tensor
 
 
+class MultimodalSharedAttention(nn.Module):
+    """Fuse action-prior hidden states with force-conditioned hidden states."""
+
+    def __init__(self, hidden_size: int, num_layers: int, num_heads: int, dropout: float):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(
+                f"`force_shared_attention_heads={num_heads}` must divide hidden_size={hidden_size}."
+            )
+        self.layers = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=hidden_size,
+                    nhead=num_heads,
+                    dim_feedforward=hidden_size * 4,
+                    dropout=dropout,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(self, action_tokens: torch.Tensor, force_tokens: torch.Tensor) -> torch.Tensor:
+        tokens = torch.cat([action_tokens, force_tokens], dim=1).to(dtype=torch.float32)
+        for layer in self.layers:
+            tokens = layer(tokens)
+        return tokens[:, : action_tokens.shape[1]]
+
+    def forward_layer(
+        self, action_tokens: torch.Tensor, force_tokens: torch.Tensor, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        action_len = action_tokens.shape[1]
+        tokens = torch.cat([action_tokens, force_tokens], dim=1).to(dtype=torch.float32)
+        tokens = self.layers[layer_idx % len(self.layers)](tokens)
+        return tokens[:, :action_len], tokens[:, action_len:]
+
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -672,6 +711,15 @@ class VLAFlowMatching(nn.Module):
             )
         else:
             self.force_refine_out_proj = None
+        if self.config.force_shared_attention_enabled:
+            self.force_shared_attention = MultimodalSharedAttention(
+                hidden_size=self.vlm_with_expert.expert_hidden_size,
+                num_layers=self.config.force_shared_attention_layers,
+                num_heads=self.config.force_shared_attention_heads,
+                dropout=self.config.force_shared_attention_dropout,
+            )
+        else:
+            self.force_shared_attention = None
         self.force_vqvae = None
         self.force_code_embedder = None
         if self.effort_tokenizer == "force_vqvae":
@@ -750,6 +798,9 @@ class VLAFlowMatching(nn.Module):
         if self.force_expert is not None:
             for params in self.force_expert.parameters():
                 params.requires_grad = self.config.train_force_expert
+        if self.force_shared_attention is not None:
+            for params in self.force_shared_attention.parameters():
+                params.requires_grad = self.config.train_force_shared_attention
 
     def _load_force_vqvae(self) -> tuple[ForceVQVAEConfig, dict]:
         ckpt_path = Path(self.config.force_vqvae_ckpt).expanduser()
@@ -1079,7 +1130,19 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        shared_inputs_embeds = None
+        shared_attention_mask = None
+        shared_position_ids = None
+        if self.force_shared_attention is not None:
+            action_suffix_embs, action_suffix_pad_masks, action_suffix_att_masks = self.embed_suffix(
+                x_t, time, effort=None
+            )
+            action_pad_masks = torch.cat([prefix_pad_masks, action_suffix_pad_masks], dim=1)
+            action_att_masks = torch.cat([prefix_att_masks, action_suffix_att_masks], dim=1)
+            shared_inputs_embeds = [prefix_embs, action_suffix_embs]
+            shared_attention_mask = make_att_2d_masks(action_pad_masks, action_att_masks)
+            shared_position_ids = torch.cumsum(action_pad_masks, dim=1) - 1
+        (_, force_suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -1087,10 +1150,14 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
             expert_model=self.force_expert,
+            shared_inputs_embeds=shared_inputs_embeds,
+            shared_attention=self.force_shared_attention,
+            shared_attention_mask=shared_attention_mask,
+            shared_position_ids=shared_position_ids,
         )
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        force_v_t = self.force_refine_out_proj(suffix_out)
+        force_suffix_out = force_suffix_out.to(dtype=torch.float32)
+        refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
+        force_v_t = self.force_refine_out_proj(refine_hidden)
         return F.mse_loss(u_t, force_v_t, reduction="none")
 
     def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, effort=None, noise=None) -> Tensor:
@@ -1230,6 +1297,21 @@ class VLAFlowMatching(nn.Module):
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        shared_inputs_embeds = None
+        shared_attention_mask = None
+        shared_position_ids = None
+        if force_refine and self.force_shared_attention is not None:
+            action_suffix_embs, action_suffix_pad_masks, action_suffix_att_masks = self.embed_suffix(
+                x_t, timestep, effort=None
+            )
+            action_suffix_len = action_suffix_pad_masks.shape[1]
+            action_prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size, action_suffix_len, prefix_len
+            )
+            action_suffix_att_2d_masks = make_att_2d_masks(action_suffix_pad_masks, action_suffix_att_masks)
+            shared_attention_mask = torch.cat([action_prefix_pad_2d_masks, action_suffix_att_2d_masks], dim=2)
+            shared_position_ids = prefix_offsets + torch.cumsum(action_suffix_pad_masks, dim=1) - 1
+            shared_inputs_embeds = [None, action_suffix_embs]
 
         outputs_embeds, _ = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
@@ -1239,10 +1321,14 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
             expert_model=self.force_expert if force_refine else None,
+            shared_inputs_embeds=shared_inputs_embeds,
+            shared_attention=self.force_shared_attention if force_refine else None,
+            shared_attention_mask=shared_attention_mask,
+            shared_position_ids=shared_position_ids,
         )
-        suffix_out = outputs_embeds[1]
+        suffix_out = outputs_embeds[1].to(dtype=torch.float32)
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+
         out_proj = self.force_refine_out_proj if force_refine else self.action_out_proj
         v_t = out_proj(suffix_out)
         return v_t
