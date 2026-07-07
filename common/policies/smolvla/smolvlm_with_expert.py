@@ -206,6 +206,7 @@ class SmolVLMWithExpertModel(nn.Module):
         head_dim,
         use_cache: bool = True,
         fill_kv_cache: bool = True,
+        update_kv_cache: bool = False,
         past_key_values=None,
     ) -> list[torch.Tensor]:
         query_states = []
@@ -264,6 +265,11 @@ class SmolVLMWithExpertModel(nn.Module):
                 # in `transformers`. (molbap)
                 key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
                 value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+                if update_kv_cache:
+                    past_key_values[layer_idx] = {
+                        "key_states": key_states,
+                        "value_states": value_states,
+                    }
 
         attention_mask_ = attention_mask_[:, : query_states.shape[1], : key_states.shape[1]]
 
@@ -412,6 +418,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: Optional[bool] = None,
         fill_kv_cache: Optional[bool] = None,
         expert_model: Optional[nn.Module] = None,
+        update_kv_cache: bool = False,
     ):
         models = [self.get_vlm_model().text_model, expert_model if expert_model is not None else self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -442,6 +449,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     head_dim,
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
+                    update_kv_cache=update_kv_cache,
                     past_key_values=past_key_values,
                 )
             else:

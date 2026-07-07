@@ -1120,14 +1120,15 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
     ) -> tuple[dict, Tensor]:
-        """Cache the slow-stage [latent | action] context at the current flow state."""
+        """Cache slow-stage action context in SmolVLA's native cache format.
+
+        Self-attention layers are refreshed to [prefix | action]. Cross-attention
+        layers keep prefix KV, matching the original SmolVLA expert design.
+        """
         action_suffix_embs, action_suffix_pad_masks, action_suffix_att_masks = self.embed_suffix(
             x_t, timestep, effort=None
         )
         action_context_pad_masks = torch.cat([prefix_pad_masks, action_suffix_pad_masks], dim=1)
-        action_context_att_masks = torch.cat([prefix_att_masks, action_suffix_att_masks], dim=1)
-        action_context_att_2d_masks = make_att_2d_masks(action_context_pad_masks, action_context_att_masks)
-        action_context_position_ids = torch.cumsum(action_context_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1156,6 +1157,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[None, action_suffix_embs],
             use_cache=True,
             fill_kv_cache=False,
+            update_kv_cache=True,
         )
         return action_context_cache, action_context_pad_masks
 
