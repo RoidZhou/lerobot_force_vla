@@ -411,15 +411,29 @@ class SmolVLAPolicy(PreTrainedPolicy):
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         effort = self.prepare_effort(batch)
+        future_effort = self.prepare_future_effort(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("actions_id_pad")
         loss_dict = {}
         model_losses = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions, effort, noise, time
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            effort,
+            noise=noise,
+            time=time,
+            future_effort=future_effort,
         )
+        force_prediction_loss = None
         if isinstance(model_losses, tuple):
-            losses, force_refine_losses = model_losses
+            if len(model_losses) == 3:
+                losses, force_refine_losses, force_prediction_loss = model_losses
+            else:
+                losses, force_refine_losses = model_losses
         else:
             losses = model_losses
             force_refine_losses = None
@@ -450,6 +464,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
             force_refine_loss = force_refine_losses.mean()
             loss_dict["force_refine_loss"] = force_refine_loss.item()
             loss = loss + self.config.force_refine_loss_weight * force_refine_loss
+        if force_prediction_loss is not None:
+            loss_dict["force_prediction_loss"] = force_prediction_loss.item()
+            loss = loss + self.config.force_prediction_loss_weight * force_prediction_loss
+        if self.config.force_prediction_enabled:
+            loss_dict["force_prediction_has_target"] = float(force_prediction_loss is not None)
         # For backward pass
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
@@ -585,6 +604,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
             history_steps = 1
         return pad_sequence(effort, history_steps)
 
+    def prepare_future_effort(self, batch):
+        """Prepare future force label for force prediction auxiliary training."""
+        if not self.config.force_prediction_enabled:
+            return None
+        key = self.config.force_prediction_target_key
+        if key not in batch:
+            return None
+        future_effort = batch[key]
+        if future_effort.ndim == 2:
+            future_effort = future_effort[:, None, :]
+        elif future_effort.ndim != 3:
+            raise ValueError(
+                f"Future effort is expected to have shape (B, D) or (B, T, D), got {future_effort.shape}."
+            )
+        future_effort = pad_vector(future_effort, self.config.effort_dim)
+        return future_effort
+
     def prepare_action(self, batch):
         """Pad action"""
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
@@ -672,6 +708,16 @@ class VLAFlowMatching(nn.Module):
             )
         else:
             self.force_refine_out_proj = None
+        if self.config.force_prediction_enabled:
+            self.force_pred_head = nn.Sequential(
+                nn.LayerNorm(self.vlm_with_expert.expert_hidden_size),
+                nn.Linear(self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size),
+                nn.SiLU(),
+                nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.effort_dim),
+            )
+        else:
+            self.force_pred_head = None
+        self._last_predicted_force = None
         self.force_vqvae = None
         self.force_code_embedder = None
         if self.effort_tokenizer == "force_vqvae":
@@ -750,6 +796,9 @@ class VLAFlowMatching(nn.Module):
         if self.force_expert is not None:
             for params in self.force_expert.parameters():
                 params.requires_grad = self.config.train_force_expert
+        if self.force_pred_head is not None:
+            for params in self.force_pred_head.parameters():
+                params.requires_grad = self.config.force_prediction_enabled
 
     def _load_force_vqvae(self) -> tuple[ForceVQVAEConfig, dict]:
         ckpt_path = Path(self.config.force_vqvae_ckpt).expanduser()
@@ -1003,7 +1052,17 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, effort=None, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        effort=None,
+        noise=None,
+        time=None,
+        future_effort=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -1041,15 +1100,23 @@ class VLAFlowMatching(nn.Module):
         if not self.config.force_refine_enabled:
             return losses
 
-        force_refine_losses = self.forward_force_refine(
+        force_refine_out = self.forward_force_refine(
             prefix_embs,
             prefix_pad_masks,
             prefix_att_masks,
             actions,
             effort=effort,
             noise=noise,
+            return_force_pred=True,
         )
-        return losses, force_refine_losses
+        force_refine_losses, force_pred = force_refine_out
+        force_prediction_loss = None
+        if self.force_pred_head is not None and force_pred is not None and future_effort is not None:
+            if future_effort.ndim == 3:
+                future_effort = future_effort.mean(dim=1)
+            future_effort = future_effort.to(device=force_pred.device, dtype=force_pred.dtype)
+            force_prediction_loss = F.smooth_l1_loss(force_pred, future_effort, reduction="mean")
+        return losses, force_refine_losses, force_prediction_loss
 
     def forward_force_refine(
         self,
@@ -1059,6 +1126,7 @@ class VLAFlowMatching(nn.Module):
         actions,
         effort=None,
         noise=None,
+        return_force_pred: bool = False,
     ) -> Tensor:
         """Train the force-refine head on the lower flow segment used by fast force updates."""
         if self.force_refine_out_proj is None:
@@ -1090,7 +1158,11 @@ class VLAFlowMatching(nn.Module):
             )
             refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
             force_v_t = self.force_refine_out_proj(refine_hidden)
-            return F.mse_loss(u_t, force_v_t, reduction="none")
+            force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
+            force_pred = self.predict_force_from_suffix(force_suffix_out)
+            if return_force_pred:
+                return force_refine_losses, force_pred
+            return force_refine_losses
 
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, effort=effort)
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -1110,7 +1182,27 @@ class VLAFlowMatching(nn.Module):
         force_suffix_out = force_suffix_out.to(dtype=torch.float32)
         refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
         force_v_t = self.force_refine_out_proj(refine_hidden)
-        return F.mse_loss(u_t, force_v_t, reduction="none")
+        force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
+        force_pred = self.predict_force_from_suffix(force_suffix_out)
+        if return_force_pred:
+            return force_refine_losses, force_pred
+        return force_refine_losses
+
+    def pool_force_hidden(self, force_suffix_out: Tensor) -> Tensor:
+        n_force_tokens = force_suffix_out.shape[1] - self.config.chunk_size
+        if n_force_tokens > 0:
+            return force_suffix_out[:, :n_force_tokens].mean(dim=1)
+        return force_suffix_out[:, -self.config.chunk_size :].mean(dim=1)
+
+    def predict_force_from_suffix(self, force_suffix_out: Tensor) -> Tensor | None:
+        if self.force_pred_head is None:
+            return None
+        force_hidden = self.pool_force_hidden(force_suffix_out)
+        force_pred = self.force_pred_head(force_hidden)
+        if self.config.force_prediction_use_tanh:
+            force_pred = self.config.force_prediction_scale * torch.tanh(force_pred)
+        self._last_predicted_force = force_pred.detach()
+        return force_pred
 
     def build_action_context_cache(
         self,
@@ -1344,6 +1436,7 @@ class VLAFlowMatching(nn.Module):
                 timestep,
                 effort=effort,
             )
+            self.predict_force_from_suffix(force_suffix_out)
             suffix_out = force_suffix_out[:, -self.config.chunk_size :]
             return self.force_refine_out_proj(suffix_out)
 
@@ -1369,6 +1462,8 @@ class VLAFlowMatching(nn.Module):
             expert_model=self.force_expert if force_refine else None,
         )
         suffix_out = outputs_embeds[1].to(dtype=torch.float32)
+        if force_refine:
+            self.predict_force_from_suffix(suffix_out)
         suffix_out = suffix_out[:, -self.config.chunk_size :]
 
         out_proj = self.force_refine_out_proj if force_refine else self.action_out_proj
