@@ -54,13 +54,24 @@ def resolve_delta_timestamps(
     delta_timestamps = {}
     effort_key = getattr(cfg, "effort_key", None)
     use_force_vqvae = getattr(cfg, "effort_tokenizer", "raw") == "force_vqvae"
+    use_force_prediction = bool(getattr(cfg, "force_prediction_enabled", False))
     for key in ds_meta.features:
         if key == "next.reward" and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == "action" and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if use_force_vqvae and key == effort_key:
-            force_delta_indices = list(range(1 - cfg.force_vqvae_window, 1))
+        if key == effort_key and (use_force_vqvae or use_force_prediction):
+            force_history_steps = getattr(cfg, "effort_history_steps", 1)
+            if use_force_vqvae:
+                force_history_steps = getattr(cfg, "force_vqvae_window", force_history_steps)
+            elif getattr(cfg, "effort_type", "none") in {"llm", "expert", "state"}:
+                force_history_steps = 1
+
+            force_delta_start = 1 - force_history_steps
+            force_delta_stop = 1
+            if use_force_prediction:
+                force_delta_stop = max(force_delta_stop, getattr(cfg, "chunk_size", 1))
+            force_delta_indices = list(range(force_delta_start, force_delta_stop))
             delta_timestamps[key] = [i / ds_meta.fps for i in force_delta_indices]
             continue
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
