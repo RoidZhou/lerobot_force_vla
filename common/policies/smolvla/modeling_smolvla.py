@@ -726,6 +726,23 @@ class VLAFlowMatching(nn.Module):
             self.force_expert = copy.deepcopy(self.vlm_with_expert.lm_expert)
         else:
             self.force_expert = None
+        if self.config.force_prediction_enabled and self.config.force_prediction_expert_enabled:
+            self.force_prediction_expert = copy.deepcopy(self.vlm_with_expert.lm_expert)
+        else:
+            self.force_prediction_expert = None
+        if self.force_prediction_expert is not None:
+            prediction_effort_in_dim = self.config.effort_dim
+            if self.config.force_prediction_effort_type == "expert_his_c":
+                prediction_effort_in_dim = self.config.effort_dim * self.config.effort_history_steps
+            self.force_prediction_effort_proj_in = nn.Linear(
+                prediction_effort_in_dim, 2 * self.vlm_with_expert.expert_hidden_size
+            )
+            self.force_prediction_effort_proj_out = nn.Linear(
+                2 * self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
+            )
+        else:
+            self.force_prediction_effort_proj_in = None
+            self.force_prediction_effort_proj_out = None
         if self.config.force_refine_enabled:
             self.force_refine_out_proj = nn.Linear(
                 self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim
@@ -820,6 +837,14 @@ class VLAFlowMatching(nn.Module):
         if self.force_expert is not None:
             for params in self.force_expert.parameters():
                 params.requires_grad = self.config.train_force_expert
+        if self.force_prediction_expert is not None:
+            for params in self.force_prediction_expert.parameters():
+                params.requires_grad = self.config.train_force_prediction_expert
+        if self.force_prediction_effort_proj_in is not None:
+            for params in self.force_prediction_effort_proj_in.parameters():
+                params.requires_grad = self.config.train_force_prediction_expert
+            for params in self.force_prediction_effort_proj_out.parameters():
+                params.requires_grad = self.config.train_force_prediction_expert
         if self.force_pred_head is not None:
             for params in self.force_pred_head.parameters():
                 params.requires_grad = self.config.force_prediction_enabled
@@ -956,6 +981,11 @@ class VLAFlowMatching(nn.Module):
         effort_hidden = F.silu(effort_hidden)
         return self.effort_proj_out(effort_hidden)
 
+    def _project_force_prediction_effort(self, effort: torch.Tensor) -> torch.Tensor:
+        effort_hidden = self.force_prediction_effort_proj_in(effort)
+        effort_hidden = F.silu(effort_hidden)
+        return self.force_prediction_effort_proj_out(effort_hidden)
+
     def _normalize_force_for_vqvae(self, effort: torch.Tensor) -> torch.Tensor:
         effort = effort.to(device=self.force_vqvae_min.device, dtype=torch.float32)
         denom = (self.force_vqvae_max - self.force_vqvae_min) + 1e-8
@@ -1027,6 +1057,38 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
+    def _process_force_prediction_effort_tokens(self, effort: torch.Tensor | None):
+        """Embed raw continuous force for the prediction expert, independent of VQ-VAE force codes."""
+        embs = []
+        pad_masks = []
+        att_masks = []
+        if self.force_prediction_effort_proj_in is None or effort is None:
+            return embs, pad_masks, att_masks
+
+        bsize = effort.shape[0]
+        device = effort.device
+        effort_type = self.config.force_prediction_effort_type
+        if effort_type == "expert":
+            effort_token = self._project_force_prediction_effort(effort[:, -1, :])[:, None, :]
+            embs.append(effort_token)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            att_masks.append(True)
+        elif effort_type == "expert_his_c":
+            effort = pad_sequence(effort, self.config.effort_history_steps)
+            effort_token = self._project_force_prediction_effort(effort.reshape(bsize, -1))[:, None, :]
+            embs.append(effort_token)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            att_masks.append(True)
+        elif effort_type == "expert_his_t":
+            effort = pad_sequence(effort, self.config.effort_history_steps)
+            for i in range(effort.shape[1]):
+                effort_token = self._project_force_prediction_effort(effort[:, i, :])[:, None, :]
+                embs.append(effort_token)
+                pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+                att_masks.append(True)
+
+        return embs, pad_masks, att_masks
+
     def embed_suffix(self, noisy_actions, timestep, effort: torch.Tensor = None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
@@ -1069,6 +1131,47 @@ class VLAFlowMatching(nn.Module):
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
         att_masks += [1] * self.config.chunk_size
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        return embs, pad_masks, att_masks
+
+    def embed_force_prediction_suffix(self, noisy_actions, timestep, effort: torch.Tensor = None):
+        """Embed raw force history plus action/time tokens for the force prediction expert."""
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        effort_embs, effort_pad_masks, effort_att_masks = self._process_force_prediction_effort_tokens(effort)
+        embs.extend(effort_embs)
+        pad_masks.extend(effort_pad_masks)
+        att_masks.extend(effort_att_masks)
+
+        action_emb = self.action_in_proj(noisy_actions)
+        device = action_emb.device
+        bsize = action_emb.shape[0]
+        dtype = action_emb.dtype
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.vlm_with_expert.expert_hidden_size,
+            self.config.min_period,
+            self.config.max_period,
+            device=device,
+        )
+        time_emb = time_emb.type(dtype=dtype)
+
+        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+        action_time_emb = self.action_time_mlp_in(action_time_emb)
+        action_time_emb = F.silu(action_time_emb)
+        action_time_emb = self.action_time_mlp_out(action_time_emb)
+
+        embs.append(action_time_emb)
+        action_time_dim = action_time_emb.shape[1]
+        pad_masks.append(torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device))
+        att_masks += [1] * self.config.chunk_size
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
@@ -1183,7 +1286,16 @@ class VLAFlowMatching(nn.Module):
             refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
             force_v_t = self.force_refine_out_proj(refine_hidden)
             force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
-            force_pred = self.predict_force_from_suffix(force_suffix_out)
+            if self.force_prediction_expert is not None:
+                force_pred = self.predict_force_from_action_cache(
+                    action_context_pad_masks,
+                    action_context_cache,
+                    x_t,
+                    time,
+                    effort=effort,
+                )
+            else:
+                force_pred = self.predict_force_from_suffix(force_suffix_out)
             if return_force_pred:
                 return force_refine_losses, force_pred
             return force_refine_losses
@@ -1227,6 +1339,25 @@ class VLAFlowMatching(nn.Module):
             force_pred = self.config.force_prediction_scale * torch.tanh(force_pred)
         self._last_predicted_force = force_pred.detach()
         return force_pred
+
+    def predict_force_from_action_cache(
+        self,
+        action_context_pad_masks,
+        action_context_cache,
+        x_t,
+        timestep,
+        effort=None,
+    ) -> Tensor | None:
+        if self.force_pred_head is None:
+            return None
+        force_suffix_out = self.forward_force_prediction_from_action_cache(
+            action_context_pad_masks,
+            action_context_cache,
+            x_t,
+            timestep,
+            effort=effort,
+        )
+        return self.predict_force_from_suffix(force_suffix_out)
 
     def build_action_context_cache(
         self,
@@ -1313,6 +1444,48 @@ class VLAFlowMatching(nn.Module):
             use_cache=True,
             fill_kv_cache=False,
             expert_model=self.force_expert,
+        )
+        return force_suffix_out.to(dtype=torch.float32)
+
+    def forward_force_prediction_from_action_cache(
+        self,
+        action_context_pad_masks,
+        action_context_cache,
+        x_t,
+        timestep,
+        effort=None,
+    ) -> Tensor:
+        """Predict future force with an independent expert over cached [latent | action] context."""
+        if self.force_prediction_expert is None:
+            raise RuntimeError(
+                "`forward_force_prediction_from_action_cache` requires "
+                "`force_prediction_expert_enabled=True`."
+            )
+
+        force_suffix_embs, force_suffix_pad_masks, force_suffix_att_masks = self.embed_force_prediction_suffix(
+            x_t, timestep, effort=effort
+        )
+
+        force_len = force_suffix_pad_masks.shape[1]
+        batch_size = action_context_pad_masks.shape[0]
+        context_len = action_context_pad_masks.shape[1]
+        context_pad_2d_masks = action_context_pad_masks[:, None, :].expand(
+            batch_size, force_len, context_len
+        )
+        force_att_2d_masks = make_att_2d_masks(force_suffix_pad_masks, force_suffix_att_masks)
+        att_2d_masks = torch.cat([context_pad_2d_masks, force_att_2d_masks], dim=2)
+
+        context_offsets = torch.sum(action_context_pad_masks, dim=-1)[:, None]
+        position_ids = context_offsets + torch.cumsum(force_suffix_pad_masks, dim=1) - 1
+
+        (_, force_suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=action_context_cache,
+            inputs_embeds=[None, force_suffix_embs],
+            use_cache=True,
+            fill_kv_cache=False,
+            expert_model=self.force_prediction_expert,
         )
         return force_suffix_out.to(dtype=torch.float32)
 
@@ -1426,6 +1599,14 @@ class VLAFlowMatching(nn.Module):
         device = x_t.device
         dt = torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32, device=device)
         remaining_steps = self.config.num_steps - self.config.force_refine_split_step
+        if self.force_prediction_expert is not None:
+            self.predict_force_from_action_cache(
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                time.expand(bsize),
+                effort=effort,
+            )
         for _ in range(remaining_steps):
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
@@ -1460,7 +1641,8 @@ class VLAFlowMatching(nn.Module):
                 timestep,
                 effort=effort,
             )
-            self.predict_force_from_suffix(force_suffix_out)
+            if self.force_prediction_expert is None:
+                self.predict_force_from_suffix(force_suffix_out)
             suffix_out = force_suffix_out[:, -self.config.chunk_size :]
             return self.force_refine_out_proj(suffix_out)
 

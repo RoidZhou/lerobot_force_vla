@@ -78,6 +78,9 @@ class SmolVLAConfig(PreTrainedConfig):
     force_prediction_loss_weight: float = 0.1
     force_prediction_use_tanh: bool = False
     force_prediction_scale: float = 1.0
+    force_prediction_expert_enabled: bool = False
+    force_prediction_effort_type: str = "expert_his_c"
+    train_force_prediction_expert: bool = True
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -164,6 +167,7 @@ class SmolVLAConfig(PreTrainedConfig):
         }
         self.effort_type = self.effort_type.lower()
         self.effort_tokenizer = self.effort_tokenizer.lower()
+        self.force_prediction_effort_type = self.force_prediction_effort_type.lower()
         if self.effort_type not in valid_effort_types:
             raise ValueError(f"`effort_type` must be one of {sorted(valid_effort_types)}, got {self.effort_type}.")
         if self.effort_tokenizer not in {"raw", "force_vqvae"}:
@@ -190,6 +194,18 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("`force_prediction_scale` must be > 0.")
         if self.force_prediction_enabled and not self.force_refine_enabled:
             raise ValueError("`force_prediction_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_prediction_expert_enabled and not self.force_prediction_enabled:
+            raise ValueError("`force_prediction_expert_enabled=True` requires `force_prediction_enabled=True`.")
+        if self.force_prediction_expert_enabled and not self.force_shared_attention_enabled:
+            raise ValueError(
+                "`force_prediction_expert_enabled=True` requires `force_shared_attention_enabled=True` "
+                "so the predictor can read cached [latent | action] context."
+            )
+        if self.force_prediction_effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+            raise ValueError(
+                "`force_prediction_effort_type` must be one of "
+                "['expert', 'expert_his_c', 'expert_his_t']."
+            )
         if self.force_expert_enabled and not self.force_refine_enabled:
             raise ValueError("`force_expert_enabled=True` requires `force_refine_enabled=True`.")
         if self.force_shared_attention_enabled and not self.force_refine_enabled:
