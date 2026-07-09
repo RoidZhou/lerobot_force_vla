@@ -1166,6 +1166,7 @@ class VLAFlowMatching(nn.Module):
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)
         action_time_emb = self.action_time_mlp_out(action_time_emb)
+        action_time_emb = action_time_emb.detach()
 
         embs.append(action_time_emb)
         action_time_dim = action_time_emb.shape[1]
@@ -1177,6 +1178,19 @@ class VLAFlowMatching(nn.Module):
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
+
+    def _detach_cache(self, cache):
+        if cache is None:
+            return None
+        if isinstance(cache, torch.Tensor):
+            return cache.detach()
+        if isinstance(cache, dict):
+            return {key: self._detach_cache(value) for key, value in cache.items()}
+        if isinstance(cache, list):
+            return [self._detach_cache(value) for value in cache]
+        if isinstance(cache, tuple):
+            return tuple(self._detach_cache(value) for value in cache)
+        return cache
 
     def forward(
         self,
@@ -1295,7 +1309,7 @@ class VLAFlowMatching(nn.Module):
                     effort=effort,
                 )
             else:
-                force_pred = self.predict_force_from_suffix(force_suffix_out)
+                force_pred = self.predict_force_from_suffix(force_suffix_out, detach_hidden=True)
             if return_force_pred:
                 return force_refine_losses, force_pred
             return force_refine_losses
@@ -1319,7 +1333,7 @@ class VLAFlowMatching(nn.Module):
         refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
         force_v_t = self.force_refine_out_proj(refine_hidden)
         force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
-        force_pred = self.predict_force_from_suffix(force_suffix_out)
+        force_pred = self.predict_force_from_suffix(force_suffix_out, detach_hidden=True)
         if return_force_pred:
             return force_refine_losses, force_pred
         return force_refine_losses
@@ -1330,10 +1344,12 @@ class VLAFlowMatching(nn.Module):
             return force_suffix_out[:, :n_force_tokens].mean(dim=1)
         return force_suffix_out[:, -self.config.chunk_size :].mean(dim=1)
 
-    def predict_force_from_suffix(self, force_suffix_out: Tensor) -> Tensor | None:
+    def predict_force_from_suffix(self, force_suffix_out: Tensor, detach_hidden: bool = False) -> Tensor | None:
         if self.force_pred_head is None:
             return None
         force_hidden = self.pool_force_hidden(force_suffix_out)
+        if detach_hidden:
+            force_hidden = force_hidden.detach()
         force_pred = self.force_pred_head(force_hidden)
         if self.config.force_prediction_use_tanh:
             force_pred = self.config.force_prediction_scale * torch.tanh(force_pred)
@@ -1352,10 +1368,10 @@ class VLAFlowMatching(nn.Module):
             return None
         force_suffix_out = self.forward_force_prediction_from_action_cache(
             action_context_pad_masks,
-            action_context_cache,
-            x_t,
-            timestep,
-            effort=effort,
+            self._detach_cache(action_context_cache),
+            x_t.detach(),
+            timestep.detach() if isinstance(timestep, torch.Tensor) else timestep,
+            effort=effort.detach() if isinstance(effort, torch.Tensor) else effort,
         )
         return self.predict_force_from_suffix(force_suffix_out)
 
