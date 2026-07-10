@@ -1333,7 +1333,17 @@ class VLAFlowMatching(nn.Module):
         refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
         force_v_t = self.force_refine_out_proj(refine_hidden)
         force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
-        force_pred = self.predict_force_from_suffix(force_suffix_out, detach_hidden=True)
+        if self.force_prediction_expert is not None:
+            force_pred = self.predict_force_direct(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                x_t,
+                time,
+                effort=effort,
+            )
+        else:
+            force_pred = self.predict_force_from_suffix(force_suffix_out, detach_hidden=True)
         if return_force_pred:
             return force_refine_losses, force_pred
         return force_refine_losses
@@ -1369,6 +1379,29 @@ class VLAFlowMatching(nn.Module):
         force_suffix_out = self.forward_force_prediction_from_action_cache(
             action_context_pad_masks,
             self._detach_cache(action_context_cache),
+            x_t.detach(),
+            timestep.detach() if isinstance(timestep, torch.Tensor) else timestep,
+            effort=effort.detach() if isinstance(effort, torch.Tensor) else effort,
+        )
+        return self.predict_force_from_suffix(force_suffix_out)
+
+    def predict_force_direct(
+        self,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        x_t,
+        timestep,
+        effort=None,
+    ) -> Tensor | None:
+        if self.force_pred_head is None:
+            return None
+        if self.force_prediction_expert is None:
+            raise RuntimeError("`predict_force_direct` requires `force_prediction_expert_enabled=True`.")
+        force_suffix_out = self.forward_force_prediction_direct(
+            prefix_embs.detach(),
+            prefix_pad_masks,
+            prefix_att_masks,
             x_t.detach(),
             timestep.detach() if isinstance(timestep, torch.Tensor) else timestep,
             effort=effort.detach() if isinstance(effort, torch.Tensor) else effort,
@@ -1505,6 +1538,40 @@ class VLAFlowMatching(nn.Module):
         )
         return force_suffix_out.to(dtype=torch.float32)
 
+    def forward_force_prediction_direct(
+        self,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
+        x_t,
+        timestep,
+        effort=None,
+    ) -> Tensor:
+        """Predict future force with an independent expert without cached action context."""
+        if self.force_prediction_expert is None:
+            raise RuntimeError(
+                "`forward_force_prediction_direct` requires `force_prediction_expert_enabled=True`."
+            )
+
+        force_suffix_embs, force_suffix_pad_masks, force_suffix_att_masks = self.embed_force_prediction_suffix(
+            x_t, timestep, effort=effort
+        )
+        pad_masks = torch.cat([prefix_pad_masks, force_suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, force_suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, force_suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, force_suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+            expert_model=self.force_prediction_expert,
+        )
+        return force_suffix_out.to(dtype=torch.float32)
+
     def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, effort=None, noise=None) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
@@ -1601,6 +1668,9 @@ class VLAFlowMatching(nn.Module):
             "x_split": x_t.detach(),
             "tau_split": time.detach(),
         }
+        if self.force_prediction_expert is not None and not self.config.force_shared_attention_enabled:
+            refine_state["prefix_embs"] = prefix_embs.detach()
+            refine_state["prefix_att_masks"] = prefix_att_masks
         actions = self.refine_actions_from_force(refine_state, effort=effort)
         return actions, refine_state
 
@@ -1616,13 +1686,23 @@ class VLAFlowMatching(nn.Module):
         dt = torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32, device=device)
         remaining_steps = self.config.num_steps - self.config.force_refine_split_step
         if self.force_prediction_expert is not None:
-            self.predict_force_from_action_cache(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                time.expand(bsize),
-                effort=effort,
-            )
+            if self.config.force_shared_attention_enabled:
+                self.predict_force_from_action_cache(
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    time.expand(bsize),
+                    effort=effort,
+                )
+            else:
+                self.predict_force_direct(
+                    refine_state["prefix_embs"],
+                    prefix_pad_masks,
+                    refine_state["prefix_att_masks"],
+                    x_t,
+                    time.expand(bsize),
+                    effort=effort,
+                )
         for _ in range(remaining_steps):
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
@@ -1684,7 +1764,7 @@ class VLAFlowMatching(nn.Module):
             expert_model=self.force_expert if force_refine else None,
         )
         suffix_out = outputs_embeds[1].to(dtype=torch.float32)
-        if force_refine:
+        if force_refine and self.force_prediction_expert is None:
             self.predict_force_from_suffix(suffix_out)
         suffix_out = suffix_out[:, -self.config.chunk_size :]
 

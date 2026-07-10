@@ -196,11 +196,6 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError("`force_prediction_enabled=True` requires `force_refine_enabled=True`.")
         if self.force_prediction_expert_enabled and not self.force_prediction_enabled:
             raise ValueError("`force_prediction_expert_enabled=True` requires `force_prediction_enabled=True`.")
-        if self.force_prediction_expert_enabled and not self.force_shared_attention_enabled:
-            raise ValueError(
-                "`force_prediction_expert_enabled=True` requires `force_shared_attention_enabled=True` "
-                "so the predictor can read cached [latent | action] context."
-            )
         if self.force_prediction_effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
             raise ValueError(
                 "`force_prediction_effort_type` must be one of "
