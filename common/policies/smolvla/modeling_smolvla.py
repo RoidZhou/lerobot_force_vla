@@ -610,32 +610,41 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """Prepare future force label for force prediction auxiliary training."""
         if not self.config.force_prediction_enabled:
             return None
-        key = self.config.force_prediction_target_key
-        if key in batch:
-            future_effort = batch[key]
-        else:
-            effort_key = None
-            for candidate_key in (self.config.effort_key, "force", OBS_EFFORT, "effort"):
-                if candidate_key in batch:
-                    effort_key = candidate_key
-                    break
-            if effort_key is None:
-                return None
+
+        effort_key = None
+        for candidate_key in (self.config.effort_key, "force", OBS_EFFORT, "effort"):
+            if candidate_key in batch:
+                effort_key = candidate_key
+                break
+
+        future_effort = None
+        if effort_key is not None:
             effort = batch[effort_key]
-            if effort.ndim == 2:
-                return None
-            if effort.ndim != 3:
+            if effort.ndim == 3:
+                history_steps = self.config.effort_history_steps
+                if self.config.effort_tokenizer == "force_vqvae":
+                    history_steps = self.config.force_vqvae_window
+                elif self.config.effort_type in {"llm", "expert", "state"}:
+                    history_steps = 1
+                if effort.shape[1] > history_steps - 1:
+                    start = history_steps - 1
+                    end = start + self.config.chunk_size
+                    future_effort = effort[:, start:end, :]
+            elif effort.ndim != 2:
                 raise ValueError(f"Effort is expected to have shape (B, D) or (B, T, D), got {effort.shape}.")
-            history_steps = self.config.effort_history_steps
-            if self.config.effort_tokenizer == "force_vqvae":
-                history_steps = self.config.force_vqvae_window
-            elif self.config.effort_type in {"llm", "expert", "state"}:
-                history_steps = 1
-            if effort.shape[1] <= history_steps - 1:
+
+        if future_effort is None:
+            key = self.config.force_prediction_target_key
+            if key not in batch:
                 return None
-            start = history_steps - 1
-            end = start + self.config.chunk_size
-            future_effort = effort[:, start:end, :]
+            future_effort = batch[key]
+            if future_effort.ndim == 2:
+                future_effort = future_effort[:, None, :]
+            elif future_effort.ndim != 3:
+                raise ValueError(
+                    f"Future effort is expected to have shape (B, D) or (B, T, D), got {future_effort.shape}."
+                )
+
         if future_effort.ndim == 2:
             future_effort = future_effort[:, None, :]
         elif future_effort.ndim != 3:
