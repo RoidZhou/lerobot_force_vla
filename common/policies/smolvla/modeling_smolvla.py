@@ -312,6 +312,19 @@ class SmolVLAPolicy(PreTrainedPolicy):
         effort_key, effort = raw_effort
         batch[effort_key] = effort
 
+    def _unnormalize_effort_target(self, effort: Tensor, effort_key: str | None) -> Tensor:
+        if effort_key is None:
+            return effort
+        buffer_name = "buffer_" + effort_key.replace(".", "_")
+        buffer = getattr(self.normalize_inputs, buffer_name, None)
+        if buffer is None or "mean" not in buffer or "std" not in buffer:
+            return effort
+        mean = buffer["mean"].to(device=effort.device, dtype=effort.dtype)
+        std = buffer["std"].to(device=effort.device, dtype=effort.dtype)
+        if torch.isinf(mean).any() or torch.isinf(std).any():
+            return effort
+        return effort * (std + 1e-8) + mean
+
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Select a single action given environment observations.
@@ -644,6 +657,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 raise ValueError(
                     f"Future effort is expected to have shape (B, D) or (B, T, D), got {future_effort.shape}."
                 )
+            future_effort = self._unnormalize_effort_target(future_effort, effort_key)
 
         if future_effort.ndim == 2:
             future_effort = future_effort[:, None, :]
