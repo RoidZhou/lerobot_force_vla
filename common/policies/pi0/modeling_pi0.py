@@ -1022,7 +1022,8 @@ class PI0FlowMatching(nn.Module):
         pad_masks = []
         att_masks = []
 
-        state_emb = self.state_proj(state)
+        state_emb = self.state_proj(state.detach())
+        state_emb = state_emb.detach()
         state_emb = state_emb.to(dtype=torch.bfloat16)
         embs.append(state_emb[:, None, :])
         bsize = state_emb.shape[0]
@@ -1046,6 +1047,7 @@ class PI0FlowMatching(nn.Module):
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)
         action_time_emb = self.action_time_mlp_out(action_time_emb)
+        action_time_emb = action_time_emb.detach()
 
         embs.append(action_time_emb)
         action_time_mask = torch.ones(bsize, action_time_emb.shape[1], dtype=torch.bool, device=device)
