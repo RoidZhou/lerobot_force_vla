@@ -86,6 +86,22 @@ class PI0Config(PreTrainedConfig):
     force_refine_loss_weight: float = 1.0
     force_expert_enabled: bool = False
     train_force_expert: bool = True
+    # Backward-compatible name: when enabled, force refinement uses a cached
+    # [latent | action] context and fresh force tokens for the lower flow segment.
+    force_shared_attention_enabled: bool = False
+    # Legacy external shared-attention knobs kept so SmolVLA force configs parse on PI0 too.
+    force_shared_attention_layers: int = 2
+    force_shared_attention_heads: int = 8
+    force_shared_attention_dropout: float = 0.0
+    train_force_shared_attention: bool = True
+    force_prediction_enabled: bool = False
+    force_prediction_target_key: str = "future.force_torque"
+    force_prediction_loss_weight: float = 0.1
+    force_prediction_use_tanh: bool = False
+    force_prediction_scale: float = 1.0
+    force_prediction_expert_enabled: bool = False
+    force_prediction_effort_type: str = "expert_his_c"
+    train_force_prediction_expert: bool = True
 
     # Decoding
     num_steps: int = 10
@@ -143,6 +159,7 @@ class PI0Config(PreTrainedConfig):
         }
         self.effort_type = self.effort_type.lower()
         self.effort_tokenizer = self.effort_tokenizer.lower()
+        self.force_prediction_effort_type = self.force_prediction_effort_type.lower()
         if self.effort_type not in valid_effort_types:
             raise ValueError(f"`effort_type` must be one of {sorted(valid_effort_types)}, got {self.effort_type}.")
         if self.effort_tokenizer not in {"raw", "force_vqvae"}:
@@ -163,8 +180,25 @@ class PI0Config(PreTrainedConfig):
                 raise ValueError("`force_vqvae_ckpt` must be set when `effort_tokenizer='force_vqvae'`.")
         if self.force_refine_loss_weight < 0:
             raise ValueError("`force_refine_loss_weight` must be >= 0.")
+        if self.force_prediction_loss_weight < 0:
+            raise ValueError("`force_prediction_loss_weight` must be >= 0.")
+        if self.force_prediction_scale <= 0:
+            raise ValueError("`force_prediction_scale` must be > 0.")
+        if self.force_prediction_enabled and not self.force_refine_enabled:
+            raise ValueError("`force_prediction_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_prediction_expert_enabled and not self.force_prediction_enabled:
+            raise ValueError("`force_prediction_expert_enabled=True` requires `force_prediction_enabled=True`.")
+        if self.force_prediction_effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+            raise ValueError(
+                "`force_prediction_effort_type` must be one of "
+                "['expert', 'expert_his_c', 'expert_his_t']."
+            )
         if self.force_expert_enabled and not self.force_refine_enabled:
             raise ValueError("`force_expert_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_shared_attention_enabled and not self.force_refine_enabled:
+            raise ValueError("`force_shared_attention_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_shared_attention_enabled and not self.force_expert_enabled:
+            raise ValueError("`force_shared_attention_enabled=True` requires `force_expert_enabled=True`.")
         if self.force_refine_enabled:
             if self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
                 raise ValueError(
