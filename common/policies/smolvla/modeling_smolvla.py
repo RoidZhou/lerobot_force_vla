@@ -418,6 +418,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
         raw_effort = self._raw_effort_for_tokenizer(batch)
+
+        effort_key = self.config.effort_key
+        if effort_key in batch and not hasattr(self, "_debug_raw_effort_printed"):
+            e = batch[effort_key].detach()
+            reduce_dim = (0, 1) if e.ndim == 3 else 0
+            print("RAW? batch effort mean:", e.mean(dim=reduce_dim).cpu())
+            print("RAW? batch effort min:", e.amin(dim=reduce_dim).cpu())
+            print("RAW? batch effort max:", e.amax(dim=reduce_dim).cpu())
+            self._debug_raw_effort_printed = True
+
         raw_future_effort = self.prepare_future_effort(batch)
         batch = self.normalize_inputs(batch)
         self._restore_raw_effort_for_tokenizer(batch, raw_effort)
@@ -1277,6 +1287,26 @@ class VLAFlowMatching(nn.Module):
         force_refine_losses, force_pred = force_refine_out
         force_prediction_loss = None
         if self.force_pred_head is not None and force_pred is not None and future_effort is not None:
+            if not hasattr(self, "_debug_force_pred_printed"):
+                with torch.no_grad():
+                    debug_future = future_effort.detach()
+                    debug_pred = force_pred.detach()
+                    if debug_future.ndim == 3:
+                        print("future_effort seq mean:", debug_future.mean(dim=(0, 1)).cpu())
+                        print("future_effort seq min:", debug_future.amin(dim=(0, 1)).cpu())
+                        print("future_effort seq max:", debug_future.amax(dim=(0, 1)).cpu())
+                        debug_future_pooled = debug_future.mean(dim=1)
+                    else:
+                        debug_future_pooled = debug_future
+
+                    print("future_effort pooled mean:", debug_future_pooled.mean(dim=0).cpu())
+                    print("future_effort pooled min:", debug_future_pooled.amin(dim=0).cpu())
+                    print("future_effort pooled max:", debug_future_pooled.amax(dim=0).cpu())
+                    print("force_pred mean:", debug_pred.mean(dim=0).cpu())
+                    print("force_pred min:", debug_pred.amin(dim=0).cpu())
+                    print("force_pred max:", debug_pred.amax(dim=0).cpu())
+                self._debug_force_pred_printed = True
+
             if future_effort.ndim == 3:
                 future_effort = future_effort.mean(dim=1)
             future_effort = future_effort.to(device=force_pred.device, dtype=force_pred.dtype)
