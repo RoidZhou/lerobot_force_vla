@@ -12,16 +12,23 @@ force_torque history [window, 6]
 -> discrete force code id
 -> decoder reconstructs normalized force_torque
 ```
-
+```text
+ur5_rg2_real_smolvla_dataset_force_boltnut_speedup_200 & force_vqvae_200     为200组螺栓拧入螺母数据集
+ur5_rg2_real_smolvla_dataset_force_pushbutton          & force_vqvae_pb_100  为100组按入插排按钮数据集
+```
 Train:
+```bash
+export HF_HOME=/root/autodl-tmp/hf_cache
+export HF_DATASETS_CACHE=/root/autodl-tmp/hf_cache/datasets
+```
 
 ```bash
 python -m lerobot.force_vqvae.train \
-  --repo_id ur5_rg2_real_smolvla_dataset_force_boltnut_speed_627 \
-  --data_root "/media/zhou/Elements SE/YBZHOU/ur5_rg2_real_smolvla_dataset_force_boltnut_speedup_total" \
+  --repo_id ur5_rg2_real_smolvla_dataset_force_pushbutton \
+  --data_root "/root/autodl-tmp/ur5_rg2_real_smolvla_dataset_force_pushbutton" \
   --force_key force_torque \
   --force_dim 6 \
-  --output_dir /tmp/force_vqvae \
+  --output_dir /root/autodl-tmp/force_vqvae_pb_100 \
   --window 16 \
   --stride 4 \
   --codebook_size 256 \
