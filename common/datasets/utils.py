@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+                                                                                                                                                                                                                                                                                                                                                    #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
@@ -29,6 +29,7 @@ import jsonlines
 import numpy as np
 import packaging.version
 import torch
+from datasets.features.features import ArrayExtensionArray
 from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
 from huggingface_hub.errors import RevisionNotFoundError
@@ -73,6 +74,30 @@ DEFAULT_FEATURES = {
     "index": {"dtype": "int64", "shape": (1,), "names": None},
     "task_index": {"dtype": "int64", "shape": (1,), "names": None},
 }
+
+
+def _patch_datasets_array_extension_to_pylist() -> None:
+    """Make datasets 3.x Array2D/Array3D features compatible with pyarrow >= 21.
+
+    Newer pyarrow forwards `maps_as_pydicts` to extension arrays when converting
+    rows to Python objects. datasets 3.4.1's ArrayExtensionArray.to_pylist does
+    not accept that keyword, which breaks datasets containing Array2D tactile
+    columns before LeRobot's torch transform can run.
+    """
+
+    if getattr(ArrayExtensionArray.to_pylist, "_lerobot_accepts_pyarrow_kwargs", False):
+        return
+
+    original_to_pylist = ArrayExtensionArray.to_pylist
+
+    def to_pylist(self, *args, **kwargs):
+        return original_to_pylist(self)
+
+    to_pylist._lerobot_accepts_pyarrow_kwargs = True
+    ArrayExtensionArray.to_pylist = to_pylist
+
+
+_patch_datasets_array_extension_to_pylist()
 
 
 def flatten_dict(d: dict, parent_key: str = "", sep: str = "/") -> dict:
