@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+from typing import List, Optional
 
 import torch
 from torch import nn
@@ -70,13 +71,13 @@ class SmolVLMWithExpertModel(nn.Module):
         num_vlm_layers: int = -1,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
-        device: str = "auto",
     ):
         super().__init__()
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
+                device_map="auto",
                 torch_dtype="bfloat16",
                 low_cpu_mem_usage=True,
             )
@@ -205,6 +206,7 @@ class SmolVLMWithExpertModel(nn.Module):
         head_dim,
         use_cache: bool = True,
         fill_kv_cache: bool = True,
+        update_kv_cache: bool = False,
         past_key_values=None,
     ) -> list[torch.Tensor]:
         query_states = []
@@ -263,6 +265,13 @@ class SmolVLMWithExpertModel(nn.Module):
                 # in `transformers`. (molbap)
                 key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
                 value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+                if update_kv_cache:
+                    past_key_values[layer_idx] = {
+                        "key_states": key_states,
+                        "value_states": value_states,
+                    }
+
+        attention_mask_ = attention_mask_[:, : query_states.shape[1], : key_states.shape[1]]
 
         attention_interface = self.get_attention_interface()
 
@@ -402,14 +411,16 @@ class SmolVLMWithExpertModel(nn.Module):
 
     def forward(
         self,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | None = None,
-        inputs_embeds: list[torch.FloatTensor] = None,
-        use_cache: bool | None = None,
-        fill_kv_cache: bool | None = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: List[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        fill_kv_cache: Optional[bool] = None,
+        expert_model: Optional[nn.Module] = None,
+        update_kv_cache: bool = False,
     ):
-        models = [self.get_vlm_model().text_model, self.lm_expert]
+        models = [self.get_vlm_model().text_model, expert_model if expert_model is not None else self.lm_expert]
         model_layers = self.get_model_layers(models)
         for hidden_states in inputs_embeds:
             # TODO this is very inefficient
@@ -438,6 +449,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     head_dim,
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
+                    update_kv_cache=update_kv_cache,
                     past_key_values=past_key_values,
                 )
             else:

@@ -14,9 +14,6 @@
 
 from dataclasses import dataclass, field
 
-from typing import Any
-
-from lerobot.common.constants import OBS_IMAGES
 from lerobot.common.optim.optimizers import AdamWConfig
 from lerobot.common.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
@@ -32,9 +29,6 @@ class SmolVLAConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 50
     n_action_steps: int = 50
-    # Frame stride for subsampling dataset frames. Set to 3 to train at 10Hz on 30Hz data.
-    frame_stride: int = 1
-    drop_n_last_frames: int = 0  # (chunk_size - n_action_steps) * frame_stride
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -47,6 +41,63 @@ class SmolVLAConfig(PreTrainedConfig):
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
+
+    # End-effector force/effort sensor conditioning.
+    # Supported values mirror the TA-VLA pi0 design:
+    # "none", "state", "llm", "llm_his_c", "llm_his_t",
+    # "expert", "expert_his_c", "expert_his_t".
+    effort_type: str = "none"
+    effort_key: str = "observation.force"
+    effort_dim: int = 6
+    effort_history_steps: int = 4
+    train_effort_proj: bool = True
+    effort_tokenizer: str = "raw"
+    force_vqvae_ckpt: str = ""
+    force_vqvae_window: int = 16
+    train_force_code_embedder: bool = True
+
+    # T-Rex-style high-frequency force refinement.
+    # When enabled, the slow SmolVLA call denoises only the first `force_refine_split_step`
+    # Euler steps and caches the partially denoised action chunk. Later calls can use fresh force
+    # readings to continue the remaining denoising steps and replace the not-yet-executed actions.
+    force_refine_enabled: bool = False
+    force_refine_split_step: int = 6
+    force_refine_loss_weight: float = 1.0
+    force_expert_enabled: bool = False
+    train_force_expert: bool = True
+    # Backward-compatible name: when enabled, force refinement uses a T-Rex-style
+    # cached [latent | action] context and fresh force tokens for the lower flow segment.
+    force_shared_attention_enabled: bool = False
+    # Legacy external shared-attention knobs kept only so older configs still parse.
+    force_shared_attention_layers: int = 2
+    force_shared_attention_heads: int = 8
+    force_shared_attention_dropout: float = 0.0
+    train_force_shared_attention: bool = True
+    force_prediction_enabled: bool = False
+    force_prediction_target_key: str = "future.force_torque"
+    force_prediction_loss_weight: float = 0.1
+    force_prediction_use_tanh: bool = False
+    force_prediction_scale: float = 1.0
+    force_prediction_expert_enabled: bool = False
+    force_prediction_effort_type: str = "expert_his_c"
+    train_force_prediction_expert: bool = True
+
+    # Tac3D tactile conditioning. In this branch tactile is used by the fast
+    # force-refine expert; force prediction still uses `effort_key`.
+    use_tactile: bool = False
+    tactile_encoder_type: str = "tac3d_cnn"  # choices: ["tac3d_cnn", "tac3d_attention", "mlp"]
+    tactile_input_shape: tuple[int, int] = (20, 20)
+    tactile_input_channels: int = 3
+    tactile_raw_shape: tuple[int, int] = (400, 3)
+    tactile_dropout: float = 0.3
+    tactile_feature_dim: int = 256
+    tactile_features: list[str] | None = field(
+        default_factory=lambda: [
+            "observation.tactile_left.distributed_force",
+            "observation.tactile_right.distributed_force",
+        ]
+    )
+    n_tactile_tokens: int = 1
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -89,7 +140,7 @@ class SmolVLAConfig(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
-    load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
+    load_vlm_weights: bool = False  # Set to True in case of training the expert from scratch. True when init from pretrained SmolVLA weights
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
 
@@ -107,34 +158,8 @@ class SmolVLAConfig(PreTrainedConfig):
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
-    # Real-Time Chunking (RTC) configuration
-    rtc_config: Any | None = None
-
-    # Tactile sensor configuration
-    use_tactile: bool = False
-    tactile_encoder_type: str = "tac3d_cnn"  # choices: ["tac3d_cnn", "tac3d_attention", "mlp"]
-    tactile_input_shape: tuple[int, int] = (20, 20)
-    tactile_input_channels: int = 3
-    tactile_raw_shape: tuple[int, int] = (400, 3)
-    tactile_dropout: float = 0.3
-    tactile_feature_dim: int = 256
-    tactile_features: list[str] | None = field(
-        default_factory=lambda: [
-            "observation.tactile_left.distributed_force",
-            "observation.tactile_right.distributed_force",
-        ]
-    )
-    # Number of prefix tokens each tactile sensor is encoded into.
-    n_tactile_tokens: int = 1
-
-    compile_model: bool = False  # Whether to use torch.compile for model optimization
-    compile_mode: str = "max-autotune"  # Torch compile mode
-
     def __post_init__(self):
         super().__post_init__()
-
-        # Update drop_n_last_frames to account for frame_stride.
-        self.drop_n_last_frames = (self.chunk_size - self.n_action_steps) * self.frame_stride
 
         """Input validation (not exhaustive)."""
         if self.n_action_steps > self.chunk_size:
@@ -146,25 +171,112 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
-        if self.use_tactile and self.tactile_encoder_type not in ["tac3d_cnn", "tac3d_attention", "mlp"]:
+        if self.use_tactile and self.tactile_encoder_type not in {"tac3d_cnn", "tac3d_attention", "mlp"}:
             raise ValueError(
                 f"Invalid tactile encoder type. Got {self.tactile_encoder_type}, "
-                f"expected one of ['tac3d_cnn', 'tac3d_attention', 'mlp']"
+                "expected one of ['tac3d_cnn', 'tac3d_attention', 'mlp']."
             )
         if self.use_tactile and self.tactile_input_shape[0] * self.tactile_input_shape[1] != self.tactile_raw_shape[0]:
             raise ValueError(
                 "`tactile_input_shape` must contain exactly `tactile_raw_shape[0]` taxels. "
                 f"Got {self.tactile_input_shape=} and {self.tactile_raw_shape=}."
             )
+        valid_effort_types = {
+            "none",
+            "no",
+            "state",
+            "llm",
+            "llm_his_c",
+            "llm_his_t",
+            "expert",
+            "expert_his_c",
+            "expert_his_t",
+        }
+        self.effort_type = self.effort_type.lower()
+        self.effort_tokenizer = self.effort_tokenizer.lower()
+        self.force_prediction_effort_type = self.force_prediction_effort_type.lower()
+        if self.effort_type not in valid_effort_types:
+            raise ValueError(f"`effort_type` must be one of {sorted(valid_effort_types)}, got {self.effort_type}.")
+        if self.effort_tokenizer not in {"raw", "force_vqvae"}:
+            raise ValueError("`effort_tokenizer` must be one of ['raw', 'force_vqvae'].")
+        if self.effort_history_steps < 1:
+            raise ValueError("`effort_history_steps` must be >= 1.")
+        if self.effort_dim < 1:
+            raise ValueError("`effort_dim` must be >= 1.")
+        if self.force_vqvae_window < 1:
+            raise ValueError("`force_vqvae_window` must be >= 1.")
+        if self.effort_tokenizer == "force_vqvae":
+            if self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+                raise ValueError(
+                    "`effort_tokenizer='force_vqvae'` requires a suffix force mode: "
+                    "`expert`, `expert_his_c`, or `expert_his_t`."
+                )
+            if not self.force_vqvae_ckpt:
+                raise ValueError("`force_vqvae_ckpt` must be set when `effort_tokenizer='force_vqvae'`.")
+        if self.force_refine_loss_weight < 0:
+            raise ValueError("`force_refine_loss_weight` must be >= 0.")
+        if self.force_prediction_loss_weight < 0:
+            raise ValueError("`force_prediction_loss_weight` must be >= 0.")
+        if self.force_prediction_scale <= 0:
+            raise ValueError("`force_prediction_scale` must be > 0.")
+        if self.force_prediction_enabled and not self.force_refine_enabled:
+            raise ValueError("`force_prediction_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_prediction_expert_enabled and not self.force_prediction_enabled:
+            raise ValueError("`force_prediction_expert_enabled=True` requires `force_prediction_enabled=True`.")
+        if self.use_tactile and self.force_prediction_enabled and not self.force_prediction_expert_enabled:
+            raise ValueError(
+                "`use_tactile=True` with force prediction requires "
+                "`force_prediction_expert_enabled=True` so force prediction remains conditioned on `effort_key`."
+            )
+        if self.force_prediction_effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+            raise ValueError(
+                "`force_prediction_effort_type` must be one of "
+                "['expert', 'expert_his_c', 'expert_his_t']."
+            )
+        if self.force_expert_enabled and not self.force_refine_enabled:
+            raise ValueError("`force_expert_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_shared_attention_enabled and not self.force_refine_enabled:
+            raise ValueError("`force_shared_attention_enabled=True` requires `force_refine_enabled=True`.")
+        if self.force_shared_attention_enabled and not self.force_expert_enabled:
+            raise ValueError("`force_shared_attention_enabled=True` requires `force_expert_enabled=True`.")
+        if self.force_refine_enabled:
+            if self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+                raise ValueError(
+                    "`force_refine_enabled=True` requires a suffix force mode: "
+                    "`expert`, `expert_his_c`, or `expert_his_t`."
+                )
+            if not (0 < self.force_refine_split_step < self.num_steps):
+                raise ValueError(
+                    "`force_refine_split_step` must be in (0, num_steps). "
+                    f"Got {self.force_refine_split_step=} and {self.num_steps=}."
+                )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
-            key = f"{OBS_IMAGES}.empty_camera_{i}"
+            key = f"observation.images.empty_camera_{i}"
             empty_camera = PolicyFeature(
                 type=FeatureType.VISUAL,
                 shape=(3, 480, 640),
             )
             self.input_features[key] = empty_camera
+        if self.effort_type not in {"none", "no"}:
+            effort_feature_type = FeatureType.ENV if self.effort_tokenizer == "force_vqvae" else FeatureType.STATE
+            if self.effort_key in self.input_features:
+                self.input_features[self.effort_key].type = effort_feature_type
+            else:
+                self.input_features[self.effort_key] = PolicyFeature(
+                    type=effort_feature_type,
+                    shape=(self.effort_dim,),
+                )
+        if self.use_tactile:
+            for tactile_key in self.tactile_features or []:
+                if tactile_key in self.input_features:
+                    self.input_features[tactile_key].type = FeatureType.ENV
+                else:
+                    self.input_features[tactile_key] = PolicyFeature(
+                        type=FeatureType.ENV,
+                        shape=self.tactile_raw_shape,
+                    )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -189,7 +301,7 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return [i * self.frame_stride for i in range(self.chunk_size)]
+        return list(range(self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:
