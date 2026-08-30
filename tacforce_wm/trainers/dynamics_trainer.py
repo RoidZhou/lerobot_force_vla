@@ -57,6 +57,7 @@ def build_dataset(cfg: dict, training: bool = True):
         val_fraction=data_cfg.get("val_fraction", 0.2),
         split_seed=data_cfg.get("split_seed", cfg.get("seed", 42)),
         force_upsample=data_cfg.get("force_upsample", 4),
+        preload_to_ram=data_cfg.get("preload_to_ram", True),
     )
 
 

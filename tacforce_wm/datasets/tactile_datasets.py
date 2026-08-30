@@ -3,7 +3,7 @@ from __future__ import annotations
 import glob
 import os
 import re
-from functools import lru_cache
+import time
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -64,8 +64,10 @@ class TacForceDataset(Dataset):
         val_fraction: float = 0.2,
         split_seed: int = 42,
         force_upsample: int = 4,
+        preload_to_ram: bool = True,
     ):
         del pad_to_multiple_of_4
+        self.training = bool(training)
         self.root_dir = os.path.abspath(os.path.expanduser(root_dir))
         self.window_size = int(window_size) if window_size is not None else None
         self.stride = max(1, int(stride))
@@ -75,6 +77,7 @@ class TacForceDataset(Dataset):
         self.tactile_right_key = tactile_right_key
         self.action_key = action_key
         self.force_upsample = int(force_upsample)
+        self.preload_to_ram = bool(preload_to_ram)
         if self.force_upsample != 4:
             raise ValueError("The unchanged condition encoder requires force_upsample=4.")
 
@@ -96,9 +99,17 @@ class TacForceDataset(Dataset):
             raise ValueError("The requested train/validation split contains no episodes.")
         self.episodes = selected
 
+        if not self.preload_to_ram:
+            raise ValueError(
+                "LeRobot dynamics training requires preload_to_ram=true to avoid "
+                "random Parquet episode re-decoding."
+            )
+
+        self.episode_data = self._preload_episodes()
+
         self.windows: list[tuple[int, int, int]] = []
-        for local_episode, (_, path) in enumerate(self.episodes):
-            length = pq.ParquetFile(path).metadata.num_rows
+        for local_episode, episode in enumerate(self.episode_data):
+            length = episode["tactile"].shape[0]
             size = length if self.window_size is None else self.window_size
             for start in range(0, length - size + 1, self.stride):
                 self.windows.append((local_episode, start, start + size))
@@ -112,32 +123,64 @@ class TacForceDataset(Dataset):
             columns.append(self.action_key)
         return columns
 
-    @lru_cache(maxsize=4)
-    def _load_episode(self, local_episode: int) -> dict[str, np.ndarray]:
-        table = pq.read_table(self.episodes[local_episode][1], columns=self._columns)
-        return {key: np.asarray(table[key].to_pylist(), dtype=np.float32) for key in self._columns}
+    def _preload_episodes(self) -> list[dict[str, np.ndarray]]:
+        started = time.perf_counter()
+        episode_data: list[dict[str, np.ndarray]] = []
+        total_bytes = 0
+        split_name = "train" if self.training else "validation"
+        print(f"[TacForceDataset] Preloading {len(self.episodes)} {split_name} episodes into RAM...")
+        for position, (episode_index, path) in enumerate(self.episodes, start=1):
+            table = pq.read_table(path, columns=self._columns)
+            arrays = {
+                key: np.asarray(table[key].to_pylist(), dtype=np.float32)
+                for key in self._columns
+            }
+            # Convert spatial tactile layout exactly once per frame. Keeping only
+            # the packed tensor also releases the two large raw tactile arrays.
+            packed = _pack_tactile(
+                arrays.pop(self.tactile_left_key),
+                arrays.pop(self.tactile_right_key),
+            )
+            data = {
+                "tactile": np.ascontiguousarray(packed),
+                "force": np.ascontiguousarray(arrays.pop(self.force_key)),
+                "state": np.ascontiguousarray(arrays.pop(self.state_key)),
+            }
+            if self.action_key:
+                data["action"] = np.ascontiguousarray(arrays.pop(self.action_key))
+            episode_data.append(data)
+            total_bytes += sum(value.nbytes for value in data.values())
+            print(
+                f"[TacForceDataset] loaded {position}/{len(self.episodes)} "
+                f"episode={episode_index} frames={len(packed)}",
+                flush=True,
+            )
+        elapsed = time.perf_counter() - started
+        print(
+            f"[TacForceDataset] RAM preload complete: {total_bytes / 1024**2:.1f} MiB "
+            f"in {elapsed:.1f}s",
+            flush=True,
+        )
+        return episode_data
 
     def __len__(self) -> int:
         return len(self.windows)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         local_episode, start, end = self.windows[idx]
-        episode = self._load_episode(local_episode)
-        tactile = _pack_tactile(
-            episode[self.tactile_left_key][start:end],
-            episode[self.tactile_right_key][start:end],
-        )
+        episode = self.episode_data[local_episode]
+        tactile = episode["tactile"][start:end]
         # The LeRobot streams are synchronous; repetition preserves the original
         # world model's four-times-faster conditioning interface.
-        force_4x = np.repeat(episode[self.force_key][start:end], self.force_upsample, axis=0)
-        state_4x = np.repeat(episode[self.state_key][start:end], self.force_upsample, axis=0)
+        force_4x = np.repeat(episode["force"][start:end], self.force_upsample, axis=0)
+        state_4x = np.repeat(episode["state"][start:end], self.force_upsample, axis=0)
         result = {
             "tactile": torch.from_numpy(tactile),
             "force_4x": torch.from_numpy(force_4x),
             "state_4x": torch.from_numpy(state_4x),
         }
         if self.action_key:
-            result["action"] = torch.from_numpy(episode[self.action_key][start:end])
+            result["action"] = torch.from_numpy(episode["action"][start:end])
         return result
 
     def get_normalizer(self, max_rows: int | None = None) -> MultiFieldNormalizer:
@@ -146,12 +189,10 @@ class TacForceDataset(Dataset):
         if max_rows and max_rows > 0:
             per_episode_limit = max(1, int(max_rows) // len(self.episodes))
         for local_episode in range(len(self.episodes)):
-            episode = self._load_episode(local_episode)
-            tactile_rows.append(_subsample_rows(_pack_tactile(
-                episode[self.tactile_left_key], episode[self.tactile_right_key]
-            ), per_episode_limit))
-            force_rows.append(_subsample_rows(episode[self.force_key], per_episode_limit))
-            state_rows.append(_subsample_rows(episode[self.state_key], per_episode_limit))
+            episode = self.episode_data[local_episode]
+            tactile_rows.append(_subsample_rows(episode["tactile"], per_episode_limit))
+            force_rows.append(_subsample_rows(episode["force"], per_episode_limit))
+            state_rows.append(_subsample_rows(episode["state"], per_episode_limit))
 
         normalizer = MultiFieldNormalizer()
         normalizer["tactile"] = FieldNormalizer.from_data_limits(np.concatenate(tactile_rows))

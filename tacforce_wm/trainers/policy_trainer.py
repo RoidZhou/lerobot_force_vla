@@ -105,6 +105,7 @@ def build_policy(
         freeze_image_encoder=policy_cfg.get("freeze_image_encoder", True),
         image_pretrained=policy_cfg.get("image_pretrained", True),
         dino_model_name=policy_cfg.get("dino_model_name", "vit_small_patch14_dinov2.lvd142m"),
+        dino_checkpoint_path=policy_cfg.get("dino_checkpoint_path"),
         tactile_future_slice=policy_cfg.get("tactile_future_slice", "front"),
         tactile_cross_heads=int(policy_cfg.get("tactile_cross_heads", 2)),
     ).to(device)

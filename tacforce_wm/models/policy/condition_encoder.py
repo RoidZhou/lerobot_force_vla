@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -18,6 +19,7 @@ class DinoV2SmallEncoder(nn.Module):
         pretrained: bool = True,
         freeze: bool = True,
         model_name: str = "vit_small_patch14_dinov2.lvd142m",
+        checkpoint_path: str | None = None,
     ):
         super().__init__()
         if timm is None:
@@ -26,11 +28,20 @@ class DinoV2SmallEncoder(nn.Module):
             )
 
         self.freeze = bool(freeze)
+        create_kwargs = {}
+        if checkpoint_path:
+            checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
+            if not os.path.isfile(checkpoint_path):
+                raise FileNotFoundError(f"Local DINOv2 checkpoint not found: {checkpoint_path}")
+            # Let timm's pretrained loader resize position embeddings while
+            # forcing the source to this local file. No Hugging Face request is made.
+            create_kwargs["pretrained_cfg_overlay"] = {"file": checkpoint_path}
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
             num_classes=0,
             img_size=224,
+            **create_kwargs,
         )
         backbone_dim = getattr(self.backbone, "num_features", None)
         if backbone_dim is None:
@@ -166,6 +177,7 @@ class ConditionEncoder(nn.Module):
         freeze_image_encoder: bool = True,
         image_pretrained: bool = True,
         dino_model_name: str = "vit_small_patch14_dinov2.lvd142m",
+        dino_checkpoint_path: str | None = None,
         image_feat_dim: int = 256,
         latent_feat_dim: int = 256,
         lowdim_feat_dim: int = 256,
@@ -183,6 +195,7 @@ class ConditionEncoder(nn.Module):
                 pretrained=image_pretrained,
                 freeze=freeze_image_encoder,
                 model_name=dino_model_name,
+                checkpoint_path=dino_checkpoint_path,
             )
         else:
             raise ValueError(f"Unsupported image_encoder_name: {image_encoder_name}")
