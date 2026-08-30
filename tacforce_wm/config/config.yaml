@@ -36,8 +36,8 @@ data:
 model:
   backend:
     type: dynamics
-    config_path: /home/zhou/anaconda3/envs/lerobot/lib/python3.10/site-packages/lerobot/tacforce_wm/outputs/tactile_boltnut_dynamics/resolved_config.yaml
-    ckpt_path: /home/zhou/anaconda3/envs/lerobot/lib/python3.10/site-packages/lerobot/tacforce_wm/outputs/tactile_boltnut_dynamics/checkpoints/best_model.pt
+    config_path: /home/zhou/anaconda3/envs/lerobot/lib/python3.10/site-packages/lerobot/outputs/tactile_boltnut_dynamics/resolved_config.yaml
+    ckpt_path: /home/zhou/anaconda3/envs/lerobot/lib/python3.10/site-packages/lerobot/outputs/tactile_boltnut_dynamics/checkpoints/best_model.pt
     normalize_keys: [tactile, force_4x]
   policy:
     action_dim: 7
@@ -55,6 +55,7 @@ model:
     freeze_image_encoder: true
     image_pretrained: true
     dino_model_name: vit_small_patch14_dinov2.lvd142m
+    dino_checkpoint_path: /home/zhou/anaconda3/envs/lerobot/lib/python3.10/site-packages/lerobot/tacforce_wm/DINOv2/model.safetensors
     diffusion_step_embed_dim: 256
     down_dims: [256, 512, 1024]
     kernel_size: 5

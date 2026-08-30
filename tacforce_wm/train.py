@@ -11,13 +11,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.set_defaults(
         task="dynamics",
-        config="tacforce_wm/config/dynamics_train.yaml",
+        config="tacforce_wm/config/dynamics_train.yaml", # dynamics_train or config
         ddp=False,
         test=False,
     )
 
     policy = subparsers.add_parser("policy", help="Train flow-matching policy")
-    policy.add_argument("--config", type=str, default="config/dynamics_train.yaml")
+    policy.add_argument("--config", type=str, default="config/config.yaml")
     policy.add_argument(
         "--benchmark",
         type=str,

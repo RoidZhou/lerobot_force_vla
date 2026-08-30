@@ -16,6 +16,9 @@ Only the input pipeline is adapted to the local LeRobot v2.1 parquet dataset:
   repeated to retain the original tokenizer's exact `36x20` input contract
 - synchronous force samples are repeated four times to retain the original
   condition encoder's exact 4x temporal contract
+- `preload_to_ram: true` reads all selected episode tactile/force/state columns
+  once at dataset construction; tactile spatial conversion is also performed
+  once, so shuffled training windows use RAM slicing without Parquet re-decoding
 
 All mappings and hyperparameters are in `config/dynamics_train.yaml`. To use the
 distributed tactile force field instead, change both tactile keys from

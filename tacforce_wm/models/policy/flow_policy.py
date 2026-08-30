@@ -36,6 +36,7 @@ class FlowMatchingPolicy(nn.Module):
         freeze_image_encoder: bool = True,
         image_pretrained: bool = True,
         dino_model_name: str = "vit_small_patch14_dinov2.lvd142m",
+        dino_checkpoint_path: str | None = None,
         tactile_future_slice: str = "front",
         tactile_cross_heads: int = 2,
     ):
@@ -91,6 +92,7 @@ class FlowMatchingPolicy(nn.Module):
             freeze_image_encoder=freeze_image_encoder,
             image_pretrained=image_pretrained,
             dino_model_name=dino_model_name,
+            dino_checkpoint_path=dino_checkpoint_path,
             cond_steps=self.curr_steps,
             tactile_cross_heads=self.tactile_cross_heads,
         )
