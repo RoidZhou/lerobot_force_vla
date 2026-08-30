@@ -1,0 +1,87 @@
+task: policy
+seed: 42
+
+runtime:
+  device: cuda
+
+output:
+  root_dir: outputs
+  run_name: wrist_policy_run
+
+data:
+  root_dir: /home/zhou/autolab/GUFIC_mujoco-main/ur5_rg2_real_smolvla_dataset_tactile_boltnut
+  format: lerobot_v2.1
+  window_size: 16
+  stride: 1
+  n_image_steps: 1
+  image_size: 224
+  preload_to_ram: false
+  image_as_uint8: true
+  action_window_size: 32
+  latent_cache_root_dir: null
+  action_dim: 7
+  action_representation: absolute
+  val_fraction: 0.2
+  split_seed: 42
+  force_upsample: 4
+  image_keys: [observation.wrist_image]
+  tactile_left_key: observation.tactile_left.displacement
+  tactile_right_key: observation.tactile_right.displacement
+  force_key: observation.force_torque
+  state_key: observation.state
+  force_4x_key: null
+  state_4x_key: null
+  action_key: action
+
+model:
+  backend:
+    type: dynamics
+    config_path: /home/zhou/anaconda3/envs/lerobot/lib/python3.10/site-packages/lerobot/tacforce_wm/outputs/tactile_boltnut_dynamics/resolved_config.yaml
+    ckpt_path: /home/zhou/anaconda3/envs/lerobot/lib/python3.10/site-packages/lerobot/tacforce_wm/outputs/tactile_boltnut_dynamics/checkpoints/best_model.pt
+    normalize_keys: [tactile, force_4x]
+  policy:
+    action_dim: 7
+    force_dim: 6
+    state_dim: 6
+    cond_dim: 256
+    curr_steps: 8
+    future_steps: 8
+    action_horizon: 32
+    n_action_steps: 32
+    action_representation: absolute
+    tactile_future_slice: front
+    tactile_cross_heads: 2
+    image_encoder_name: dinov2_small
+    freeze_image_encoder: true
+    image_pretrained: true
+    dino_model_name: vit_small_patch14_dinov2.lvd142m
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+  dynamics: {}
+
+train:
+  batch_size: 16
+  val_batch_size: 16
+  num_workers: 4
+  ddp_num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  epochs: 200
+  grad_clip: 1.0
+  use_amp: false
+  lr_warmup_steps: 0
+  normalizer_max_rows: 500000
+  open_loop_test_every: 5
+  open_loop_test_max_batches: 20
+  optimizer:
+    lr: 1.0e-4
+    min_lr: 1.0e-6
+    weight_decay: 1.0e-4
+
+checkpoint:
+  save_every: 100
+  val_every: 5
+  best_metric: loss
