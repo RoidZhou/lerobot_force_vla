@@ -1,0 +1,89 @@
+task: dynamics
+seed: 42
+
+runtime:
+  device: cuda
+
+output:
+  root_dir: outputs
+  run_name: tactile_boltnut_dynamics
+
+data:
+  root_dir: /home/zhou/autolab/GUFIC_mujoco-main/ur5_rg2_real_smolvla_dataset_tactile_boltnut
+  format: lerobot_v2.1
+  window_size: 16
+  stride: 1
+  val_fraction: 0.2
+  split_seed: 42
+  force_upsample: 4
+  pad_to_multiple_of_4: true
+  normalize_keys: [tactile, force_4x]
+  keys:
+    force: observation.force_torque
+    state: observation.state
+    tactile_left: observation.tactile_left.displacement
+    tactile_right: observation.tactile_right.displacement
+    action: null
+
+model:
+  backend: {}
+  policy: {}
+  dynamics:
+    chunk_horizon: 8
+    chunk_stride: 1
+    future_shift: 8
+    use_delta_latent: false
+    model_dim: 384
+    tactile_embed_dim: 128
+    dropout: 0.15
+    max_seq_len: 32
+    tactile_in_channels: 3
+    tactile_hand_dim: 48
+    tactile_hidden_channels: 128
+    tactile_mid_channels: 128
+    tactile_depth: 4
+    tactile_heads: 4
+    force_dim: 6
+    state_dim: 6
+    cond_dim: 128
+    cond_hidden_dim: 256
+    use_force: true
+    use_state: false
+    use_delta_force: false
+    use_delta_state: false
+    cond_branch_depth: 1
+    cond_kernel_size: 5
+    depth: 4
+    heads: 8
+    dim_head: 64
+    mlp_dim: 512
+    use_condition: true
+    mse_weight: 1.0
+    delta_latent_weight: 1.0
+    sigreg_weight: 0.09
+    sigreg_knots: 17
+    sigreg_num_proj: 512
+
+train:
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 8
+  ddp_num_workers: 16
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  epochs: 64
+  grad_clip: null
+  use_amp: false
+  normalizer_max_rows: 200000
+  lr_warmup_steps: 1000
+  optimizer:
+    lr: 3.0e-4
+    min_lr: 1.0e-6
+    weight_decay: 1.0e-5
+
+checkpoint:
+  load_path: ${output.root_dir}/${output.run_name}/checkpoints/best_model.pt
+  save_every: 1
+  val_every: 5
+  best_metric: loss_mse
