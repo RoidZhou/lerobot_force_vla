@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import io
 import os
 import re
@@ -11,6 +12,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
+import zarr
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -58,8 +60,10 @@ class LeRobotPolicyDataset(Dataset):
         split_seed: int = 42,
         force_upsample: int = 4,
         format: str | None = None,
+        expected_dynamics_ckpt_path: str | None = None,
+        expected_dino_checkpoint_path: str | None = None,
     ):
-        del preload_to_ram, latent_cache_root_dir, force_4x_key, state_4x_key, format
+        del force_4x_key, state_4x_key, format
         self.root_dir = os.path.abspath(os.path.expanduser(root_dir))
         self.split = split
         self.window_size = max(1, int(window_size))
@@ -69,6 +73,8 @@ class LeRobotPolicyDataset(Dataset):
         self.n_image_steps = max(1, int(n_image_steps or 1))
         self.action_window_size = max(1, int(action_window_size or window_size))
         self.image_as_uint8 = bool(image_as_uint8)
+        self.preload_to_ram = bool(preload_to_ram)
+        self.latent_cache_root_dir = latent_cache_root_dir
         self.image_keys = list(image_keys)
         self.tactile_left_key = tactile_left_key
         self.tactile_right_key = tactile_right_key
@@ -77,6 +83,8 @@ class LeRobotPolicyDataset(Dataset):
         self.action_key = action_key
         self.action_representation = str(action_representation).lower()
         self.force_upsample = int(force_upsample)
+        self.expected_dynamics_ckpt_path = expected_dynamics_ckpt_path
+        self.expected_dino_checkpoint_path = expected_dino_checkpoint_path
         if self.action_representation != "absolute":
             raise ValueError("This 6D-state/7D-action dataset requires action_representation='absolute'.")
         if self.force_upsample != 4:
@@ -112,11 +120,128 @@ class LeRobotPolicyDataset(Dataset):
         self.cached_tactile_latent_curr = None
         self.cached_tactile_latent_future = None
         self.cached_latent_dim = None
+        self.latent_cache_zarr = None
+        self.latent_cache_group = None
+        self.numeric_episode_data: list[dict[str, np.ndarray]] | None = None
+        self._maybe_open_latent_cache()
+        self._maybe_preload_training_data()
 
     @property
     def _columns(self) -> list[str]:
-        return [*self.image_keys, self.tactile_left_key, self.tactile_right_key,
-                self.force_key, self.state_key, self.action_key]
+        columns = [self.force_key, self.state_key, self.action_key]
+        if self.cached_image_backbone_feat is None:
+            columns.extend(self.image_keys)
+        if self.cached_tactile_latent_curr is None:
+            columns.extend([self.tactile_left_key, self.tactile_right_key])
+        return columns
+
+    def _cache_path(self) -> str | None:
+        if not self.latent_cache_root_dir:
+            return None
+        return os.path.join(
+            os.path.abspath(os.path.expanduser(self.latent_cache_root_dir)),
+            self.split,
+            "policy_latent_cache.zarr",
+        )
+
+    def _window_metadata(self) -> tuple[np.ndarray, np.ndarray]:
+        episode_indices = np.asarray([self.episodes[ep][0] for ep, _ in self.windows], dtype=np.int64)
+        anchors = np.asarray([anchor for _, anchor in self.windows], dtype=np.int64)
+        return episode_indices, anchors
+
+    def _maybe_open_latent_cache(self) -> None:
+        path = self._cache_path()
+        if path is None:
+            return
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f"Policy latent cache not found: {path}. Run tools/precompute_policy_latents.py first."
+            )
+        root = zarr.open_group(path, mode="r")
+        if "data" not in root or "meta" not in root:
+            raise KeyError(f"Invalid policy latent cache structure: {path}")
+        data, meta = root["data"], root["meta"]
+        required = ("tactile_latent_curr", "tactile_latent_future", "image_backbone_feat")
+        for key in required:
+            if key not in data:
+                raise KeyError(f"Policy latent cache is missing data/{key}: {path}")
+        for key in ("window_episode_indices", "window_anchor_times"):
+            if key not in meta:
+                raise KeyError(f"Policy latent cache is missing meta/{key}: {path}")
+
+        expected_episode, expected_anchor = self._window_metadata()
+        cached_episode = np.asarray(meta["window_episode_indices"][:], dtype=np.int64)
+        cached_anchor = np.asarray(meta["window_anchor_times"][:], dtype=np.int64)
+        if not np.array_equal(cached_episode, expected_episode) or not np.array_equal(cached_anchor, expected_anchor):
+            raise ValueError("Policy latent cache windows do not match the current dataset split/config.")
+        expected_attrs = {
+            "window_size": self.window_size,
+            "action_window_size": self.action_window_size,
+            "stride": self.stride,
+            "tactile_left_key": self.tactile_left_key,
+            "tactile_right_key": self.tactile_right_key,
+        }
+        for key, expected in expected_attrs.items():
+            actual = root.attrs.get(key)
+            if actual is not None and str(actual) != str(expected):
+                raise ValueError(f"Policy latent cache mismatch for {key}: cache={actual}, config={expected}")
+        for attr, expected_path in (
+            ("dynamics_checkpoint_sha256", self.expected_dynamics_ckpt_path),
+            ("dino_checkpoint_sha256", self.expected_dino_checkpoint_path),
+        ):
+            if expected_path:
+                expected_hash = self._sha256(expected_path)
+                cached_hash = root.attrs.get(attr)
+                if cached_hash != expected_hash:
+                    raise ValueError(
+                        f"Policy latent cache was built with a different checkpoint ({attr}). "
+                        "Re-run tools/precompute_policy_latents.py --overwrite."
+                    )
+
+        self.latent_cache_zarr = root
+        self.latent_cache_group = data
+        self.cached_tactile_latent_curr = data["tactile_latent_curr"]
+        self.cached_tactile_latent_future = data["tactile_latent_future"]
+        self.cached_image_backbone_feat = data["image_backbone_feat"]
+        self.cached_latent_dim = int(self.cached_tactile_latent_curr.shape[-1])
+        for key in required:
+            if data[key].shape[0] != len(self.windows):
+                raise ValueError(f"Cache row mismatch for {key}: {data[key].shape[0]} vs {len(self.windows)}")
+        print(f"[LeRobotPolicyDataset] Using latent cache: {path}")
+
+    @staticmethod
+    def _sha256(path: str) -> str:
+        resolved = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"Checkpoint used for cache validation not found: {resolved}")
+        digest = hashlib.sha256()
+        with open(resolved, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _maybe_preload_training_data(self) -> None:
+        if not self.preload_to_ram:
+            return
+        self.numeric_episode_data = []
+        numeric_keys = (self.force_key, self.state_key, self.action_key)
+        for _, path in self.episodes:
+            table = pq.read_table(path, columns=list(numeric_keys))
+            self.numeric_episode_data.append({
+                key: np.asarray(table[key].to_pylist(), dtype=np.float32)
+                for key in numeric_keys
+            })
+        if self.latent_cache_group is not None:
+            self.cached_tactile_latent_curr = np.asarray(
+                self.latent_cache_group["tactile_latent_curr"][:], dtype=np.float32
+            )
+            self.cached_tactile_latent_future = np.asarray(
+                self.latent_cache_group["tactile_latent_future"][:], dtype=np.float32
+            )
+            self.cached_image_backbone_feat = np.asarray(
+                self.latent_cache_group["image_backbone_feat"][:], dtype=np.float32
+            )
+        print(f"[LeRobotPolicyDataset] Preloaded numeric/cache arrays for split={self.split}")
 
     @lru_cache(maxsize=8)
     def _load_row_group(self, episode_id: int, row_group: int) -> dict:
@@ -129,6 +254,8 @@ class LeRobotPolicyDataset(Dataset):
         return result
 
     def _read_slice(self, episode_id: int, key: str, start: int, end: int):
+        if self.numeric_episode_data is not None and key in self.numeric_episode_data[episode_id]:
+            return self.numeric_episode_data[episode_id][key][start:end]
         parquet = pq.ParquetFile(self.episodes[episode_id][1])
         offsets = []
         total = 0
@@ -166,6 +293,13 @@ class LeRobotPolicyDataset(Dataset):
             tensors.append(x)
         return torch.stack(tensors)
 
+    def get_image_input(self, idx: int) -> torch.Tensor:
+        episode_id, anchor = self.windows[idx]
+        image_start = anchor - self.n_image_steps + 1
+        views = [self._process_images(self._read_slice(episode_id, key, image_start, anchor + 1))
+                 for key in self.image_keys]
+        return torch.stack(views, dim=1)
+
     def __len__(self) -> int:
         return len(self.windows)
 
@@ -183,21 +317,28 @@ class LeRobotPolicyDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         episode_id, anchor = self.windows[idx]
         obs_start, obs_end = anchor - self.window_size + 1, anchor + 1
-        image_start = anchor - self.n_image_steps + 1
-        dynamics = self.get_dynamics_input(idx)
-
-        views = [self._process_images(self._read_slice(episode_id, key, image_start, anchor + 1))
-                 for key in self.image_keys]
-        # [T,V,C,H,W], where V=1 and is strictly the wrist camera.
-        image = torch.stack(views, dim=1)
         obs = {
-            "image": image,
             "force": torch.from_numpy(self._read_slice(episode_id, self.force_key, obs_start, obs_end)),
             "state": torch.from_numpy(self._read_slice(episode_id, self.state_key, obs_start, obs_end)),
-            "tactile": torch.from_numpy(dynamics["tactile"]),
-            "force_4x": torch.from_numpy(dynamics["force_4x"]),
-            "state_4x": torch.from_numpy(dynamics["state_4x"]),
         }
+        if self.cached_tactile_latent_curr is not None:
+            obs["tactile_latent_curr"] = torch.from_numpy(
+                np.asarray(self.cached_tactile_latent_curr[idx], dtype=np.float32)
+            )
+            obs["tactile_latent_future"] = torch.from_numpy(
+                np.asarray(self.cached_tactile_latent_future[idx], dtype=np.float32)
+            )
+        else:
+            dynamics = self.get_dynamics_input(idx)
+            obs["tactile"] = torch.from_numpy(dynamics["tactile"])
+            obs["force_4x"] = torch.from_numpy(dynamics["force_4x"])
+            obs["state_4x"] = torch.from_numpy(dynamics["state_4x"])
+        if self.cached_image_backbone_feat is not None:
+            obs["image_backbone_feat"] = torch.from_numpy(
+                np.asarray(self.cached_image_backbone_feat[idx], dtype=np.float32)
+            )
+        else:
+            obs["image"] = self.get_image_input(idx)
         action = self._read_slice(episode_id, self.action_key, anchor,
                                   anchor + self.action_window_size)[:, :self.action_dim]
         return {"obs": obs, "action": torch.from_numpy(action)}
@@ -206,10 +347,13 @@ class LeRobotPolicyDataset(Dataset):
         fields = {"action": [], "force": [], "state": []}
         limit = max(1, int(max_rows) // len(self.episodes)) if max_rows else None
         for episode_id in range(len(self.episodes)):
-            table = pq.read_table(self.episodes[episode_id][1],
-                                  columns=[self.action_key, self.force_key, self.state_key])
-            episode = {key: np.asarray(table[key].to_pylist(), dtype=np.float32)
-                       for key in (self.action_key, self.force_key, self.state_key)}
+            if self.numeric_episode_data is not None:
+                episode = self.numeric_episode_data[episode_id]
+            else:
+                table = pq.read_table(self.episodes[episode_id][1],
+                                      columns=[self.action_key, self.force_key, self.state_key])
+                episode = {key: np.asarray(table[key].to_pylist(), dtype=np.float32)
+                           for key in (self.action_key, self.force_key, self.state_key)}
             fields["action"].append(_subsample(episode[self.action_key][:, :self.action_dim], limit))
             fields["force"].append(_subsample(episode[self.force_key], limit))
             fields["state"].append(_subsample(episode[self.state_key], limit))

@@ -65,3 +65,64 @@ First finish dynamics training so its `best_model.pt` exists, then run:
 ```
 
 Policy outputs are written to `outputs/wrist_policy_run/`.
+
+## Precompute the Policy cache
+
+Policy training can cache all frozen computation: the local DINOv2 wrist-image
+backbone feature and the frozen TacForce model's current/future tactile latents.
+The cache is tied to the exact DINO and Dynamics checkpoint SHA256 values; if
+either checkpoint changes, training asks you to rebuild it instead of silently
+using stale features.
+
+Use `distributed_force` for both Dynamics and Policy, then set the cloud paths:
+
+```yaml
+data:
+  root_dir: /root/autodl-tmp/Tactile-VLA/ur5_rg2_real_smolvla_dataset_tactile_boltnut
+  latent_cache_root_dir: /root/autodl-tmp/Tactile-VLA/tacforce_policy_cache
+  preload_to_ram: true
+  tactile_left_key: observation.tactile_left.distributed_force
+  tactile_right_key: observation.tactile_right.distributed_force
+
+model:
+  backend:
+    config_path: /absolute/path/to/dynamics/resolved_config.yaml
+    ckpt_path: /absolute/path/to/dynamics/checkpoints/best_model.pt
+  policy:
+    freeze_image_encoder: true
+    dino_checkpoint_path: /absolute/path/to/DINOv2/model.safetensors
+```
+
+Generate both splits before starting Policy training. On a 96 GB RTX PRO 6000,
+start with batch 128 and increase to 256 if GPU memory permits:
+
+```bash
+cd /absolute/path/to/tacforce_wm
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+python tools/precompute_policy_latents.py \
+  --config config/config.yaml \
+  --split all \
+  --batch-size 128 \
+  --chunk-size 64 \
+  --amp
+```
+
+This creates:
+
+```text
+/root/autodl-tmp/Tactile-VLA/tacforce_policy_cache/
+├── train/policy_latent_cache.zarr/
+└── val/policy_latent_cache.zarr/
+```
+
+Then train normally:
+
+```bash
+python train.py policy --config config/config.yaml
+```
+
+With `preload_to_ram: true`, numeric observations/actions and all three cache
+arrays are loaded once. Policy batches then contain only `force`, `state`,
+`action`, `image_backbone_feat`, `tactile_latent_curr`, and
+`tactile_latent_future`; raw PNG and tactile columns are not read during
+training. Rebuild an existing cache explicitly with `--overwrite`.

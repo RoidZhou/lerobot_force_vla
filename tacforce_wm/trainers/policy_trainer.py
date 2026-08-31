@@ -34,6 +34,8 @@ def build_dataloaders(cfg: dict):
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
     dataset_kwargs = dict(data_cfg)
+    dataset_kwargs["expected_dynamics_ckpt_path"] = cfg_get(cfg, "model.backend.ckpt_path")
+    dataset_kwargs["expected_dino_checkpoint_path"] = cfg_get(cfg, "model.policy.dino_checkpoint_path")
     if dataset_kwargs.get("n_image_steps") is None:
         dataset_kwargs["n_image_steps"] = cfg_get(cfg, "model.policy.curr_steps", 1)
     if dataset_kwargs.get("action_representation") is None:
