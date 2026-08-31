@@ -22,8 +22,8 @@ data:
   keys:
     force: observation.force_torque
     state: observation.state
-    tactile_left: observation.tactile_left.displacement
-    tactile_right: observation.tactile_right.displacement
+    tactile_left: observation.tactile_left.distributed_force
+    tactile_right: observation.tactile_right.distributed_force
     action: null
 
 model:
