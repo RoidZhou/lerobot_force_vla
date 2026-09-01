@@ -75,11 +75,7 @@ from lerobot.common.policies.utils import (
     populate_queues,
 )
 from lerobot.common.utils.utils import get_safe_dtype
-try:
-    from lerobot.force_vqvae.models import ForceVQVAE, ForceVQVAEConfig
-except ModuleNotFoundError:  # Optional legacy component; not used by TacForce-VLA.
-    ForceVQVAE = None
-    ForceVQVAEConfig = None
+
 from lerobot.tacforce_wm.models.dynamics.frozen import FrozenTacForceDynamics
 
 OBS_TACTILE = "observation.tactile"
@@ -1083,21 +1079,6 @@ class VLAFlowMatching(nn.Module):
                 for params in module.parameters():
                     params.requires_grad = train_bridge
 
-    def _load_force_vqvae(self) -> tuple[ForceVQVAEConfig, dict]:
-        if ForceVQVAE is None or ForceVQVAEConfig is None:
-            raise ImportError("`effort_tokenizer='force_vqvae'` requires the optional lerobot.force_vqvae package.")
-        ckpt_path = Path(self.config.force_vqvae_ckpt).expanduser()
-        if not ckpt_path.is_file():
-            raise FileNotFoundError(f"`force_vqvae_ckpt` does not exist: {ckpt_path}")
-        blob = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        force_vqvae_cfg = ForceVQVAEConfig.from_dict(blob["config"])
-        self.force_vqvae = ForceVQVAE(force_vqvae_cfg)
-        self.force_vqvae.load_state_dict(blob["model_state"])
-        self.force_vqvae.eval()
-        for param in self.force_vqvae.parameters():
-            param.requires_grad = False
-        return force_vqvae_cfg, blob["stats"]
-
     def sample_noise(self, shape, device):
         noise = torch.normal(
             mean=0.0,
@@ -1431,8 +1412,22 @@ class VLAFlowMatching(nn.Module):
         }
         with torch.no_grad():
             latent = self.tacforce_dynamics(obs, compute_predict=True)
-        current = self.tacforce_current_proj(latent["tactile_latent_curr"])
-        future = self.tacforce_future_proj(latent["tactile_latent_future"])
+        # TacForce-WM is trained by _build_chunk_sample on
+        #   input  = z[:, :chunk_horizon]
+        #   target = z[:, future_shift:future_shift + chunk_horizon].
+        # Consequently only the first chunk_horizon prediction positions are
+        # supervised.  Do not expose the unsupervised tail to the VLA expert.
+        supervised_steps = int(self.tacforce_dynamics.wm.chunk_horizon)
+        current_latent = latent["tactile_latent_curr"]
+        future_latent = latent["tactile_latent_future"]
+        if current_latent.shape[1] < supervised_steps or future_latent.shape[1] < supervised_steps:
+            raise ValueError(
+                "TacForce-WM returned fewer latent steps than its supervised chunk horizon: "
+                f"current={current_latent.shape}, future={future_latent.shape}, "
+                f"chunk_horizon={supervised_steps}."
+            )
+        current = self.tacforce_current_proj(current_latent[:, :supervised_steps])
+        future = self.tacforce_future_proj(future_latent[:, :supervised_steps])
         return self.tacforce_cross_attention(current, future)
 
     def embed_tactile_refine_suffix(self, tactile_tokens: Tensor | None, x_t: Tensor, timestep: Tensor):
