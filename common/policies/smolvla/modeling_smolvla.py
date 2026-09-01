@@ -75,9 +75,47 @@ from lerobot.common.policies.utils import (
     populate_queues,
 )
 from lerobot.common.utils.utils import get_safe_dtype
-from lerobot.force_vqvae.models import ForceVQVAE, ForceVQVAEConfig
+try:
+    from lerobot.force_vqvae.models import ForceVQVAE, ForceVQVAEConfig
+except ModuleNotFoundError:  # Optional legacy component; not used by TacForce-VLA.
+    ForceVQVAE = None
+    ForceVQVAEConfig = None
+from lerobot.tacforce_wm.models.dynamics.frozen import FrozenTacForceDynamics
 
 OBS_TACTILE = "observation.tactile"
+
+
+class TacForceCrossAttention(nn.Module):
+    """Fuse frozen current and world-model-predicted tactile latent tokens."""
+
+    def __init__(self, dim: int, heads: int, max_steps: int, dropout: float):
+        super().__init__()
+        if dim % heads:
+            raise ValueError(f"TacForce token dim {dim} must be divisible by heads={heads}.")
+        self.max_steps = int(max_steps)
+        self.pos = nn.Parameter(torch.randn(1, self.max_steps, dim) * 0.02)
+        self.q_norm = nn.LayerNorm(dim)
+        self.k_norm = nn.LayerNorm(dim)
+        self.v_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.ff_norm = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, 4 * dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(4 * dim, dim), nn.Dropout(dropout),
+        )
+
+    def forward(self, current: Tensor, future: Tensor) -> Tensor:
+        if current.shape != future.shape or current.ndim != 3:
+            raise ValueError(f"Expected matching [B,T,D] TacForce latents, got {current.shape}/{future.shape}.")
+        steps = current.shape[1]
+        if steps > self.max_steps:
+            raise ValueError(f"TacForce history {steps} exceeds max_steps={self.max_steps}.")
+        pos = self.pos[:, :steps].to(dtype=current.dtype)
+        context, _ = self.attn(
+            self.q_norm(current + pos), self.k_norm(future + pos), self.v_norm(future + pos)
+        )
+        fused = current + context
+        return fused + self.ff(self.ff_norm(fused))
 
 
 def create_sinusoidal_pos_embedding(
@@ -295,6 +333,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 if effort_key != self.config.effort_key:
                     self._queues[effort_key] = deque(maxlen=effort_queue_len)
         self._force_refine_state = None
+        self._tacforce_tactile_queues = {
+            key: deque(maxlen=self.config.tacforce_wm_history_steps)
+            for key in (self.config.tactile_features or [])
+        }
+        self._tacforce_force_queue = deque(maxlen=self.config.tacforce_wm_history_steps)
 
     def get_optim_params(self) -> dict:
         return self.parameters()
@@ -337,6 +380,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()
+        raw_tactile, raw_force = self._raw_tacforce_inputs(batch, inference=True)
 
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
@@ -356,6 +400,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             state = self.prepare_state(batch)
             effort = self.prepare_effort(batch)
             tactile_data = self._extract_tactile_data(batch)
+            tactile_tokens = self.model.encode_tacforce_refine_tokens(
+                raw_tactile if self.config.tacforce_wm_enabled else tactile_data, raw_force
+            )
             lang_tokens, lang_masks = self.prepare_language(batch)
 
             if self.config.force_refine_enabled:
@@ -366,7 +413,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     lang_masks,
                     state,
                     effort=effort,
-                    tactile_data=tactile_data,
+                    tactile_tokens=tactile_tokens,
                     noise=noise,
                 )
             else:
@@ -398,6 +445,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise RuntimeError("No queued actions remain to refine.")
 
         self.eval()
+        raw_tactile, raw_force = self._raw_tacforce_inputs(batch, inference=True)
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
         raw_effort = self._raw_effort_for_tokenizer(batch)
@@ -410,10 +458,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         effort = self.prepare_effort(batch)
         tactile_data = self._extract_tactile_data(batch)
+        tactile_tokens = self.model.encode_tacforce_refine_tokens(
+            raw_tactile if self.config.tacforce_wm_enabled else tactile_data, raw_force
+        )
         refined_actions = self.model.refine_actions_from_force(
             self._force_refine_state,
             effort=effort,
-            tactile_data=tactile_data,
+            tactile_tokens=tactile_tokens,
         )
 
         original_action_dim = self.config.action_feature.shape[0]
@@ -434,6 +485,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
         raw_effort = self._raw_effort_for_tokenizer(batch)
+        raw_tactile, raw_force = self._raw_tacforce_inputs(batch, inference=False)
 
         effort_key = self.config.effort_key
         if effort_key in batch and not hasattr(self, "_debug_raw_effort_printed"):
@@ -452,6 +504,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         effort = self.prepare_effort(batch)
         tactile_data = self._extract_tactile_data(batch)
+        tactile_tokens = self.model.encode_tacforce_refine_tokens(
+            raw_tactile if self.config.tacforce_wm_enabled else tactile_data, raw_force
+        )
         future_effort = raw_future_effort
         lang_tokens, lang_masks = self.prepare_language(batch)
         actions = self.prepare_action(batch)
@@ -468,7 +523,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             noise=noise,
             time=time,
             future_effort=future_effort,
-            tactile_data=tactile_data,
+            tactile_tokens=tactile_tokens,
         )
         force_prediction_loss = None
         if isinstance(model_losses, tuple):
@@ -616,10 +671,59 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
         return tactile_data
 
+    def _raw_tacforce_inputs(
+        self, batch: dict[str, Tensor], *, inference: bool
+    ) -> tuple[list[Tensor] | None, Tensor | None]:
+        """Return raw contiguous histories; inference queues use first-frame left padding."""
+        if not self.config.tacforce_wm_enabled:
+            return None, None
+        tactile_keys = self.config.tactile_features or []
+        if len(tactile_keys) != 2 or any(key not in batch for key in tactile_keys):
+            raise KeyError(f"TacForce-WM requires both tactile keys {tactile_keys}.")
+        force_key = next(
+            (key for key in (self.config.effort_key, "force", OBS_EFFORT, "effort") if key in batch),
+            None,
+        )
+        if force_key is None:
+            raise KeyError(f"TacForce-WM requires raw force input `{self.config.effort_key}`.")
+
+        if not inference:
+            tactile = [batch[key] for key in tactile_keys]
+            force = batch[force_key]
+            expected = self.config.tacforce_wm_history_steps
+            if any(x.ndim != 4 or x.shape[1] != expected for x in tactile):
+                raise ValueError(f"Training tactile inputs must contain exactly {expected} contiguous frames.")
+            if force.ndim != 3 or force.shape[1] != expected:
+                raise ValueError(f"Training force input must be [B,{expected},6], got {force.shape}.")
+            return tactile, force
+
+        for key in tactile_keys:
+            value = batch[key]
+            if value.ndim == 4:
+                value = value[:, -1]
+            queue = self._tacforce_tactile_queues[key]
+            if not queue:
+                queue.extend([value] * queue.maxlen)
+            else:
+                queue.append(value)
+        force = batch[force_key]
+        if force.ndim == 3:
+            force = force[:, -1]
+        if not self._tacforce_force_queue:
+            self._tacforce_force_queue.extend([force] * self._tacforce_force_queue.maxlen)
+        else:
+            self._tacforce_force_queue.append(force)
+        return (
+            [torch.stack(list(self._tacforce_tactile_queues[key]), dim=1) for key in tactile_keys],
+            torch.stack(list(self._tacforce_force_queue), dim=1),
+        )
+
     def _prepare_tactile_tensor(self, tactile: Tensor) -> Tensor:
         """Use the latest tactile frame and keep the Tac3D raw shape for the encoder."""
         raw_ndim = len(self.config.tactile_raw_shape)
-        if tactile.ndim == raw_ndim + 2:
+        if self.config.tacforce_wm_enabled and tactile.ndim == raw_ndim + 2:
+            return tactile
+        if tactile.ndim == raw_ndim + 2 and not self.config.tacforce_wm_enabled:
             tactile = tactile[:, -1]
         if tactile.ndim != raw_ndim + 1:
             raise ValueError(
@@ -797,7 +901,7 @@ class VLAFlowMatching(nn.Module):
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
-        if self.config.use_tactile:
+        if self.config.use_tactile and not self.config.tacforce_wm_enabled:
             self.tactile_encoder = TactileTokenEncoder(
                 encoder_type=self.config.tactile_encoder_type,
                 input_shape=self.config.tactile_input_shape,
@@ -814,6 +918,30 @@ class VLAFlowMatching(nn.Module):
         else:
             self.tactile_encoder = None
             self.tactile_proj = None
+        if self.config.tacforce_wm_enabled:
+            self.tacforce_dynamics = FrozenTacForceDynamics(
+                {
+                    "config_path": self.config.tacforce_wm_config_path,
+                    "ckpt_path": self.config.tacforce_wm_ckpt_path,
+                    "normalize_keys": ["tactile", "force_4x"],
+                },
+                device="cpu",
+            )
+            latent_dim = self.tacforce_dynamics.latent_dim
+            expert_dim = self.vlm_with_expert.expert_hidden_size
+            self.tacforce_current_proj = nn.Sequential(nn.LayerNorm(latent_dim), nn.Linear(latent_dim, expert_dim), nn.SiLU())
+            self.tacforce_future_proj = nn.Sequential(nn.LayerNorm(latent_dim), nn.Linear(latent_dim, expert_dim), nn.SiLU())
+            self.tacforce_cross_attention = TacForceCrossAttention(
+                expert_dim,
+                self.config.tacforce_wm_cross_attention_heads,
+                self.config.tacforce_wm_history_steps,
+                self.config.tacforce_wm_cross_attention_dropout,
+            )
+        else:
+            self.tacforce_dynamics = None
+            self.tacforce_current_proj = None
+            self.tacforce_future_proj = None
+            self.tacforce_cross_attention = None
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
         if self.config.force_expert_enabled:
@@ -947,8 +1075,17 @@ class VLAFlowMatching(nn.Module):
                 params.requires_grad = self.config.force_refine_enabled
             for params in self.tactile_proj.parameters():
                 params.requires_grad = self.config.force_refine_enabled
+        if self.tacforce_dynamics is not None:
+            for params in self.tacforce_dynamics.parameters():
+                params.requires_grad = False
+            train_bridge = self.config.train_tacforce_cross_attention
+            for module in (self.tacforce_current_proj, self.tacforce_future_proj, self.tacforce_cross_attention):
+                for params in module.parameters():
+                    params.requires_grad = train_bridge
 
     def _load_force_vqvae(self) -> tuple[ForceVQVAEConfig, dict]:
+        if ForceVQVAE is None or ForceVQVAEConfig is None:
+            raise ImportError("`effort_tokenizer='force_vqvae'` requires the optional lerobot.force_vqvae package.")
         ckpt_path = Path(self.config.force_vqvae_ckpt).expanduser()
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"`force_vqvae_ckpt` does not exist: {ckpt_path}")
@@ -1258,27 +1395,63 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 
-    def embed_tactile_refine_suffix(
-        self,
-        noisy_actions,
-        timestep,
-        effort: torch.Tensor = None,
-        tactile_data: list[Tensor] | None = None,
-    ):
-        """Embed tactile distributed-force tokens plus action/time tokens for force refinement."""
+    @staticmethod
+    def _pack_tacforce_tactile(tactile_data: list[Tensor]) -> Tensor:
+        """Convert two [B,T,400,3] Tac3D histories to TacForce [B,T,36,20,6]."""
+        if len(tactile_data) != 2:
+            raise ValueError(f"TacForce-WM requires left and right tactile tensors, got {len(tactile_data)}.")
+        packed_hands = []
+        for tactile in tactile_data:
+            if tactile.ndim != 4 or tuple(tactile.shape[-2:]) != (400, 3):
+                raise ValueError(f"TacForce tactile input must be [B,T,400,3], got {tactile.shape}.")
+            bsize, steps = tactile.shape[:2]
+            hand = tactile.reshape(bsize * steps, 20, 20, 3).permute(0, 3, 1, 2)
+            hand = F.interpolate(hand.float(), size=(35, 20), mode="bilinear", align_corners=False)
+            hand = hand.permute(0, 2, 3, 1).reshape(bsize, steps, 35, 20, 3)
+            packed_hands.append(hand)
+        tactile = torch.cat(packed_hands, dim=-1)
+        return torch.cat([tactile, tactile[:, :, -1:]], dim=2)
+
+    def encode_tacforce_refine_tokens(
+        self, tactile_data: list[Tensor] | None, force_history: Tensor | None
+    ) -> Tensor | None:
+        if not self.config.tacforce_wm_enabled:
+            if not self.config.use_tactile:
+                return None
+            legacy_embs, _, _ = self._process_tactile_tokens(tactile_data)
+            return torch.cat(legacy_embs, dim=1)
+        if tactile_data is None or force_history is None:
+            raise ValueError("TacForce-WM refinement requires tactile_data and raw force_history.")
+        if force_history.ndim != 3 or force_history.shape[1] != self.config.tacforce_wm_history_steps:
+            raise ValueError(f"TacForce force history must be [B,16,6], got {force_history.shape}.")
+        tactile = self._pack_tacforce_tactile(tactile_data)
+        obs = {
+            "tactile": tactile,
+            "force_4x": torch.repeat_interleave(force_history.float(), self.config.tacforce_wm_force_upsample, dim=1),
+        }
+        with torch.no_grad():
+            latent = self.tacforce_dynamics(obs, compute_predict=True)
+        current = self.tacforce_current_proj(latent["tactile_latent_curr"])
+        future = self.tacforce_future_proj(latent["tactile_latent_future"])
+        return self.tacforce_cross_attention(current, future)
+
+    def embed_tactile_refine_suffix(self, tactile_tokens: Tensor | None, x_t: Tensor, timestep: Tensor):
+        """Embed precomputed TacForce cross-attention tokens plus x_t/time tokens."""
         if not self.config.use_tactile:
-            return self.embed_suffix(noisy_actions, timestep, effort=effort)
+            return self.embed_suffix(x_t, timestep, effort=None)
+        if tactile_tokens is None:
+            raise ValueError("Tactile refinement requires precomputed TacForce cross-attention tokens.")
 
         embs = []
         pad_masks = []
         att_masks = []
 
-        tactile_embs, tactile_pad_masks, tactile_att_masks = self._process_tactile_tokens(tactile_data)
-        embs.extend(tactile_embs)
-        pad_masks.extend(tactile_pad_masks)
-        att_masks.extend(tactile_att_masks)
+        bsize, n_tactile_tokens = tactile_tokens.shape[:2]
+        embs.append(tactile_tokens)
+        pad_masks.append(torch.ones(bsize, n_tactile_tokens, dtype=torch.bool, device=tactile_tokens.device))
+        att_masks.extend([True] * n_tactile_tokens)
 
-        action_emb = self.action_in_proj(noisy_actions)
+        action_emb = self.action_in_proj(x_t)
         device = action_emb.device
         bsize = action_emb.shape[0]
         dtype = action_emb.dtype
@@ -1374,7 +1547,7 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         time=None,
         future_effort=None,
-        tactile_data=None,
+        tactile_tokens=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -1418,7 +1591,7 @@ class VLAFlowMatching(nn.Module):
             prefix_att_masks,
             actions,
             effort=effort,
-            tactile_data=tactile_data,
+            tactile_tokens=tactile_tokens,
             noise=noise,
             return_force_pred=True,
         )
@@ -1458,7 +1631,7 @@ class VLAFlowMatching(nn.Module):
         prefix_att_masks,
         actions,
         effort=None,
-        tactile_data=None,
+        tactile_tokens=None,
         noise=None,
         return_force_pred: bool = False,
     ) -> Tensor:
@@ -1488,8 +1661,7 @@ class VLAFlowMatching(nn.Module):
                 action_context_cache,
                 x_t,
                 time,
-                effort=effort,
-                tactile_data=tactile_data,
+                tactile_tokens=tactile_tokens,
             )
             refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
             force_v_t = self.force_refine_out_proj(refine_hidden)
@@ -1509,10 +1681,7 @@ class VLAFlowMatching(nn.Module):
             return force_refine_losses
 
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_tactile_refine_suffix(
-            x_t,
-            time,
-            effort=effort,
-            tactile_data=tactile_data,
+            tactile_tokens, x_t, time
         )
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -1662,18 +1831,14 @@ class VLAFlowMatching(nn.Module):
         action_context_cache,
         x_t,
         timestep,
-        effort=None,
-        tactile_data=None,
+        tactile_tokens=None,
     ) -> Tensor:
         """Run force expert on fresh tactile tokens while attending cached [latent | action] KV."""
         if self.force_expert is None:
             raise RuntimeError("Force-cache refinement requires `force_expert_enabled=True`.")
 
         force_suffix_embs, force_suffix_pad_masks, force_suffix_att_masks = self.embed_tactile_refine_suffix(
-            x_t,
-            timestep,
-            effort=effort,
-            tactile_data=tactile_data,
+            tactile_tokens, x_t, timestep
         )
 
         force_len = force_suffix_pad_masks.shape[1]
@@ -1818,7 +1983,7 @@ class VLAFlowMatching(nn.Module):
         return x_t
 
     def sample_actions_for_force_refine(
-        self, images, img_masks, lang_tokens, lang_masks, state, effort=None, tactile_data=None, noise=None
+        self, images, img_masks, lang_tokens, lang_masks, state, effort=None, tactile_tokens=None, noise=None
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Run the slow split stage and immediately refine once with the current force.
 
@@ -1874,14 +2039,14 @@ class VLAFlowMatching(nn.Module):
         if self.force_prediction_expert is not None and not self.config.force_shared_attention_enabled:
             refine_state["prefix_embs"] = prefix_embs.detach()
             refine_state["prefix_att_masks"] = prefix_att_masks
-        actions = self.refine_actions_from_force(refine_state, effort=effort, tactile_data=tactile_data)
+        actions = self.refine_actions_from_force(refine_state, effort=effort, tactile_tokens=tactile_tokens)
         return actions, refine_state
 
     def refine_actions_from_force(
         self,
         refine_state: dict[str, Tensor],
         effort=None,
-        tactile_data=None,
+        tactile_tokens=None,
     ) -> Tensor:
         """Continue the lower flow segment from cached x_split using a fresh tactile condition."""
         prefix_pad_masks = refine_state["prefix_pad_masks"]
@@ -1919,7 +2084,7 @@ class VLAFlowMatching(nn.Module):
                 x_t,
                 expanded_time,
                 effort,
-                tactile_data=tactile_data,
+                tactile_tokens=tactile_tokens,
                 force_refine=True,
             )
             x_t += dt * v_t
@@ -1933,7 +2098,7 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
         effort=None,
-        tactile_data=None,
+        tactile_tokens=None,
         force_refine: bool = False,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
@@ -1945,8 +2110,7 @@ class VLAFlowMatching(nn.Module):
                 past_key_values,
                 x_t,
                 timestep,
-                effort=effort,
-                tactile_data=tactile_data,
+                tactile_tokens=tactile_tokens,
             )
             if self.force_prediction_expert is None:
                 self.predict_force_from_suffix(force_suffix_out)
@@ -1955,10 +2119,7 @@ class VLAFlowMatching(nn.Module):
 
         if force_refine:
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_tactile_refine_suffix(
-                x_t,
-                timestep,
-                effort=effort,
-                tactile_data=tactile_data,
+                tactile_tokens, x_t, timestep
             )
         else:
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep, effort=effort)

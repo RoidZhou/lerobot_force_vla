@@ -99,6 +99,18 @@ class SmolVLAConfig(PreTrainedConfig):
     )
     n_tactile_tokens: int = 1
 
+    # Frozen TacForce-WM conditioning for the tactile refinement expert.  The
+    # dataset supplies a contiguous history during training; inference builds
+    # the same history in SmolVLAPolicy's queues.
+    tacforce_wm_enabled: bool = False
+    tacforce_wm_config_path: str = ""
+    tacforce_wm_ckpt_path: str = ""
+    tacforce_wm_history_steps: int = 16
+    tacforce_wm_force_upsample: int = 4
+    tacforce_wm_cross_attention_heads: int = 2
+    tacforce_wm_cross_attention_dropout: float = 0.1
+    train_tacforce_cross_attention: bool = True
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
@@ -181,6 +193,19 @@ class SmolVLAConfig(PreTrainedConfig):
                 "`tactile_input_shape` must contain exactly `tactile_raw_shape[0]` taxels. "
                 f"Got {self.tactile_input_shape=} and {self.tactile_raw_shape=}."
             )
+        if self.tacforce_wm_enabled:
+            if not self.use_tactile:
+                raise ValueError("`tacforce_wm_enabled=True` requires `use_tactile=True`.")
+            if not self.force_refine_enabled:
+                raise ValueError("`tacforce_wm_enabled=True` requires `force_refine_enabled=True`.")
+            if not self.tacforce_wm_config_path or not self.tacforce_wm_ckpt_path:
+                raise ValueError(
+                    "Set both `tacforce_wm_config_path` and `tacforce_wm_ckpt_path` when TacForce-WM is enabled."
+                )
+            if self.tacforce_wm_history_steps != 16:
+                raise ValueError("The pretrained TacForce-WM currently requires a 16-frame history.")
+            if self.tacforce_wm_force_upsample != 4:
+                raise ValueError("The pretrained TacForce-WM condition encoder requires force upsample=4.")
         valid_effort_types = {
             "none",
             "no",
@@ -240,7 +265,7 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.force_shared_attention_enabled and not self.force_expert_enabled:
             raise ValueError("`force_shared_attention_enabled=True` requires `force_expert_enabled=True`.")
         if self.force_refine_enabled:
-            if self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+            if not self.tacforce_wm_enabled and self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
                 raise ValueError(
                     "`force_refine_enabled=True` requires a suffix force mode: "
                     "`expert`, `expert_his_c`, or `expert_his_t`."
@@ -277,6 +302,14 @@ class SmolVLAConfig(PreTrainedConfig):
                         type=FeatureType.ENV,
                         shape=self.tactile_raw_shape,
                     )
+        if self.tacforce_wm_enabled:
+            if self.effort_key in self.input_features:
+                self.input_features[self.effort_key].type = FeatureType.ENV
+            else:
+                self.input_features[self.effort_key] = PolicyFeature(
+                    type=FeatureType.ENV,
+                    shape=(self.effort_dim,),
+                )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -297,6 +330,15 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
+        return [0]
+
+    def observation_delta_indices_for_key(self, key: str) -> list:
+        """Only TacForce tactile/force fields need the 16-frame training history."""
+        if self.tacforce_wm_enabled and key in {
+            self.effort_key,
+            *(self.tactile_features or []),
+        }:
+            return list(range(1 - self.tacforce_wm_history_steps, 1))
         return [0]
 
     @property

@@ -58,7 +58,9 @@ def resolve_delta_timestamps(
         if key == "action" and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+            per_key = getattr(cfg, "observation_delta_indices_for_key", None)
+            indices = per_key(key) if callable(per_key) else cfg.observation_delta_indices
+            delta_timestamps[key] = [i / ds_meta.fps for i in indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None

@@ -10,8 +10,12 @@ import torch
 import torch.nn as nn
 import yaml
 
-from models.dynamics.world_model import TacForceWorldModel
-from utils.normalizer import MultiFieldNormalizer
+try:  # Imported as lerobot.tacforce_wm.models.dynamics.frozen.
+    from .world_model import TacForceWorldModel
+    from ...utils.normalizer import MultiFieldNormalizer
+except ImportError:  # Backward compatibility with train.py run from tacforce_wm/.
+    from models.dynamics.world_model import TacForceWorldModel
+    from utils.normalizer import MultiFieldNormalizer
 
 
 def _to_ns(x: Any) -> Any:
@@ -160,6 +164,13 @@ class FrozenTacForceDynamics(BaseDynamics):
     def latent_dim(self) -> int:
         return self._latent_dim
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # The pretrained tokenizer and world model must stay deterministic and
+        # frozen even when the surrounding policy enters training mode.
+        self.wm.eval()
+        return self
+
     @torch.no_grad()
     def forward(
         self,
@@ -171,8 +182,9 @@ class FrozenTacForceDynamics(BaseDynamics):
         for k in ("state_4x", "delta_force_4x", "delta_state_4x"):
             if k in obs:
                 batch[k] = obs[k]
+        device = next(self.wm.parameters()).device
         batch = {
-            k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v)
+            k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
             for k, v in batch.items()
         }
         for k in self.normalize_keys:
