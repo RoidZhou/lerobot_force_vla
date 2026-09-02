@@ -492,7 +492,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             print("RAW? batch effort max:", e.amax(dim=reduce_dim).cpu())
             self._debug_raw_effort_printed = True
 
-        raw_future_effort = self.prepare_future_effort(batch)
+        raw_future_effort, future_effort_valid = self.prepare_future_effort(batch)
         batch = self.normalize_inputs(batch)
         self._restore_raw_effort_for_tokenizer(batch, raw_effort)
         batch = self.normalize_targets(batch)
@@ -519,6 +519,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             noise=noise,
             time=time,
             future_effort=future_effort,
+            future_effort_valid=future_effort_valid,
             tactile_tokens=tactile_tokens,
         )
         force_prediction_loss = None
@@ -689,9 +690,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             expected = self.config.tacforce_wm_history_steps
             if any(x.ndim != 4 or x.shape[1] != expected for x in tactile):
                 raise ValueError(f"Training tactile inputs must contain exactly {expected} contiguous frames.")
-            if force.ndim != 3 or force.shape[1] != expected:
-                raise ValueError(f"Training force input must be [B,{expected},6], got {force.shape}.")
-            return tactile, force
+            if force.ndim != 3 or force.shape[1] < expected:
+                raise ValueError(f"Training force input must contain at least [B,{expected},6], got {force.shape}.")
+            return tactile, force[:, :expected]
 
         for key in tactile_keys:
             value = batch[key]
@@ -769,13 +770,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
             history_steps = self.config.force_vqvae_window
         elif self.config.effort_type in {"llm", "expert", "state"}:
             history_steps = 1
-        effort = effort[:, :history_steps, :]
+        if self.config.tacforce_wm_enabled and effort.shape[1] >= self.config.tacforce_wm_history_steps:
+            # The combined training tensor is [-15..0..future]. Restrict raw
+            # effort tokens to the historical portion, then keep its newest frames.
+            effort = effort[:, : self.config.tacforce_wm_history_steps, :]
+        effort = effort[:, -history_steps:, :]
         return pad_sequence(effort, history_steps)
 
     def prepare_future_effort(self, batch):
         """Prepare future force label for force prediction auxiliary training."""
         if not self.config.force_prediction_enabled:
-            return None
+            return None, None
 
         effort_key = None
         for candidate_key in (self.config.effort_key, "force", OBS_EFFORT, "effort"):
@@ -784,25 +789,34 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 break
 
         future_effort = None
+        future_valid = None
         if effort_key is not None:
             effort = batch[effort_key]
             if effort.ndim == 3:
-                history_steps = self.config.effort_history_steps
-                if self.config.effort_tokenizer == "force_vqvae":
-                    history_steps = self.config.force_vqvae_window
-                elif self.config.effort_type in {"llm", "expert", "state"}:
-                    history_steps = 1
-                if effort.shape[1] > history_steps - 1:
+                if self.config.tacforce_wm_enabled:
+                    history_steps = self.config.tacforce_wm_history_steps
+                else:
+                    history_steps = self.config.effort_history_steps
+                    if self.config.effort_tokenizer == "force_vqvae":
+                        history_steps = self.config.force_vqvae_window
+                    elif self.config.effort_type in {"llm", "expert", "state"}:
+                        history_steps = 1
+                future_horizon = self.config.force_prediction_horizon
+                if effort.shape[1] >= history_steps - 1 + future_horizon:
+                    # Current t is both the last history frame and first target.
                     start = history_steps - 1
-                    end = start + self.config.chunk_size
+                    end = start + future_horizon
                     future_effort = effort[:, start:end, :]
+                    pad_key = f"{effort_key}_is_pad"
+                    if pad_key in batch:
+                        future_valid = ~batch[pad_key][:, start:end].to(dtype=torch.bool)
             elif effort.ndim != 2:
                 raise ValueError(f"Effort is expected to have shape (B, D) or (B, T, D), got {effort.shape}.")
 
         if future_effort is None:
             key = self.config.force_prediction_target_key
             if key not in batch:
-                return None
+                return None, None
             future_effort = batch[key]
             if future_effort.ndim == 2:
                 future_effort = future_effort[:, None, :]
@@ -819,8 +833,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 f"Future effort is expected to have shape (B, D) or (B, T, D), got {future_effort.shape}."
             )
         future_effort = pad_vector(future_effort, self.config.effort_dim)
-        future_effort = pad_sequence(future_effort, self.config.chunk_size)
-        return future_effort
+        future_effort = pad_sequence(future_effort, self.config.force_prediction_horizon)
+        if future_valid is None:
+            future_valid = torch.ones(
+                future_effort.shape[:2], dtype=torch.bool, device=future_effort.device
+            )
+        else:
+            future_valid = pad_sequence(
+                future_valid.unsqueeze(-1), self.config.force_prediction_horizon
+            ).squeeze(-1)
+        return future_effort, future_valid
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1542,6 +1564,7 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         time=None,
         future_effort=None,
+        future_effort_valid=None,
         tactile_tokens=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
@@ -1614,7 +1637,13 @@ class VLAFlowMatching(nn.Module):
                 self._debug_force_pred_printed = True
 
             if future_effort.ndim == 3:
-                future_effort = future_effort.mean(dim=1)
+                if future_effort_valid is None:
+                    future_effort = future_effort.mean(dim=1)
+                else:
+                    valid = future_effort_valid.to(
+                        device=future_effort.device, dtype=future_effort.dtype
+                    ).unsqueeze(-1)
+                    future_effort = (future_effort * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
             future_effort = future_effort.to(device=force_pred.device, dtype=force_pred.dtype)
             force_prediction_loss = F.smooth_l1_loss(force_pred, future_effort, reduction="mean")
         return losses, force_refine_losses, force_prediction_loss
