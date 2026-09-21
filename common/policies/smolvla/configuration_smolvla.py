@@ -83,13 +83,63 @@ class SmolVLAConfig(PreTrainedConfig):
     force_prediction_effort_type: str = "expert_his_c"
     train_force_prediction_expert: bool = True
 
+    # FR-VLA tactile/pose names.  The legacy force_* options remain readable so
+    # existing checkpoints/configs do not break; these options take precedence.
+    tactile_refine_enabled: bool = False
+    tactile_refine_split_step: int = 6
+    tactile_refine_loss_weight: float = 1.0
+    tactile_expert_enabled: bool = False
+    train_tactile_expert: bool = True
+    reference_pose_enabled: bool = False
+    reference_pose_expert_enabled: bool = False
+    train_reference_pose_expert: bool = True
+    reference_pose_key: str = "observation.fingertip_pose_relative_to_nut"
+    reference_pose_future_delta: int = 1
+    reference_pose_dim: int = 6
+    reference_pose_indices: list[int] | None = None
+    reference_pose_loss_weight: float = 0.2
+    reference_pose_position_weight: float = 1.0
+    reference_pose_rotation_weight: float = 1.0
+    reference_pose_smooth_l1_beta: float = 0.01
+    # Keep the supervised absolute reference pose physically interpretable by
+    # preventing tactile-refinement loss from updating its expert through e_t.
+    reference_pose_detach_for_refine: bool = True
+
+    posenet_enabled: bool = False
+    posenet_checkpoint_path: str = ""
+    posenet_module_root: str = "/home/zhou/vla/force-vla/lerobot-mujoco-vla"
+    freeze_posenet: bool = True
+    posenet_sensor_grid_size: int = 32
+    posenet_sensor_shape: tuple[int, int] = (32, 32)
+    posenet_allow_sensor_resize: bool = False
+
+    tactile_tokenizer_enabled: bool = False
+    tactile_tokenizer_checkpoint_path: str = ""
+    tactile_tokenizer_module_root: str = "/home/zhou/vla/force-vla/lerobot-mujoco-vla"
+    tactile_tokenizer_output: str = "tokens"
+    tactile_tokenizer_sensor_grid_size: int = 32
+    tactile_tokenizer_sensor_shape: tuple[int, int] = (32, 32)
+    tactile_tokenizer_allow_sensor_resize: bool = False
+    freeze_tactile_tokenizer: bool = True
+    train_tactile_projection: bool = True
+
+    tactile_servo_enabled: bool = False
+    tactile_servo_kp: list[float] = field(default_factory=lambda: [0.15, 0.15, 0.03, 0.10, 0.10, 0.0])
+    tactile_servo_ki: list[float] = field(default_factory=lambda: [0.0] * 6)
+    tactile_servo_kd: list[float] = field(default_factory=lambda: [0.0] * 6)
+    tactile_servo_integral_clip: list[float] = field(default_factory=lambda: [0.02, 0.02, 0.02, 0.2, 0.2, 0.2])
+    tactile_servo_filter_alpha: float = 0.2
+    tactile_servo_max_position_m: float = 0.003
+    tactile_servo_max_tilt_rad: float = 0.034906585
+
     # Tac3D tactile conditioning. In this branch tactile is used by the fast
     # force-refine expert; force prediction still uses `effort_key`.
     use_tactile: bool = False
     tactile_encoder_type: str = "tac3d_cnn"  # choices: ["tac3d_cnn", "tac3d_attention", "mlp"]
     tactile_input_shape: tuple[int, int] = (20, 20)
     tactile_input_channels: int = 3
-    tactile_raw_shape: tuple[int, int] = (400, 3)
+    # Supports flattened [N,C] and spatial [H,W,C] tactile tensors.
+    tactile_raw_shape: tuple[int, ...] = (400, 3)
     tactile_dropout: float = 0.3
     tactile_feature_dim: int = 256
     tactile_features: list[str] | None = field(
@@ -111,6 +161,7 @@ class SmolVLAConfig(PreTrainedConfig):
     tacforce_wm_cross_attention_heads: int = 2
     tacforce_wm_cross_attention_dropout: float = 0.1
     train_tacforce_cross_attention: bool = True
+    tactile_tokenizer_only: bool = True
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -174,6 +225,26 @@ class SmolVLAConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
+        # Canonicalize the new terminology while accepting old FR-VLA configs.
+        if self.tactile_refine_enabled:
+            self.force_refine_enabled = True
+            self.force_refine_split_step = self.tactile_refine_split_step
+            self.force_refine_loss_weight = self.tactile_refine_loss_weight
+        if self.tactile_expert_enabled:
+            self.force_expert_enabled = True
+            self.train_force_expert = self.train_tactile_expert
+        if self.tactile_tokenizer_enabled:
+            # The new FR-VLA path uses PoseNet's tokenizer directly and must not
+            # instantiate or execute TacForce-WM.
+            self.tacforce_wm_enabled = False
+        if self.reference_pose_enabled:
+            self.reference_pose_expert_enabled = True
+            # The old auxiliary force target/expert is replaced, not run in parallel.
+            self.force_prediction_enabled = False
+            self.force_prediction_expert_enabled = False
+            if not self.tactile_tokenizer_enabled:
+                raise ValueError("`reference_pose_enabled=True` requires `tactile_tokenizer_enabled=True`.")
+
         """Input validation (not exhaustive)."""
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
@@ -189,11 +260,56 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"Invalid tactile encoder type. Got {self.tactile_encoder_type}, "
                 "expected one of ['tac3d_cnn', 'tac3d_attention', 'mlp']."
             )
-        if self.use_tactile and self.tactile_input_shape[0] * self.tactile_input_shape[1] != self.tactile_raw_shape[0]:
-            raise ValueError(
-                "`tactile_input_shape` must contain exactly `tactile_raw_shape[0]` taxels. "
-                f"Got {self.tactile_input_shape=} and {self.tactile_raw_shape=}."
-            )
+        if self.use_tactile:
+            if len(self.tactile_raw_shape) == 2:
+                tactile_shape_matches = (
+                    self.tactile_input_shape[0] * self.tactile_input_shape[1] == self.tactile_raw_shape[0]
+                    and self.tactile_raw_shape[1] == self.tactile_input_channels
+                )
+            elif len(self.tactile_raw_shape) == 3:
+                tactile_shape_matches = (
+                    tuple(self.tactile_input_shape) == tuple(self.tactile_raw_shape[:2])
+                    and self.tactile_raw_shape[2] == self.tactile_input_channels
+                )
+            else:
+                tactile_shape_matches = False
+            if not tactile_shape_matches:
+                raise ValueError(
+                    "`tactile_input_shape`/channels must match flattened [N,C] or spatial [H,W,C] "
+                    f"`tactile_raw_shape`; got {self.tactile_input_shape=}, "
+                    f"{self.tactile_input_channels=}, {self.tactile_raw_shape=}."
+                )
+        if self.reference_pose_enabled:
+            if not self.tactile_refine_enabled:
+                raise ValueError("`reference_pose_enabled=True` requires `tactile_refine_enabled=True`.")
+            if not self.posenet_enabled:
+                raise ValueError("`reference_pose_enabled=True` requires `posenet_enabled=True`.")
+            if self.reference_pose_dim not in {4, 6}:
+                raise ValueError("`reference_pose_dim` must be 4 or 6.")
+            if self.reference_pose_dim == 4 and self.reference_pose_indices is None:
+                self.reference_pose_indices = [0, 1, 3, 4]
+            if self.reference_pose_indices is not None and len(self.reference_pose_indices) != self.reference_pose_dim:
+                raise ValueError("`reference_pose_indices` length must equal `reference_pose_dim`.")
+            if self.reference_pose_indices is not None:
+                if any(i < 0 or i > 5 for i in self.reference_pose_indices):
+                    raise ValueError("`reference_pose_indices` values must be in [0,5].")
+                if not any(i < 3 for i in self.reference_pose_indices) or not any(i >= 3 for i in self.reference_pose_indices):
+                    raise ValueError("`reference_pose_indices` must include position and rotation axes.")
+            if self.reference_pose_future_delta < 0:
+                raise ValueError("`reference_pose_future_delta` must be >= 0.")
+            if self.reference_pose_loss_weight < 0:
+                raise ValueError("`reference_pose_loss_weight` must be >= 0.")
+        if self.posenet_enabled and (not self.posenet_checkpoint_path or not self.posenet_module_root):
+            raise ValueError("Set `posenet_checkpoint_path` and `posenet_module_root` when PoseNet is enabled.")
+        if self.tactile_tokenizer_enabled:
+            if not self.use_tactile:
+                raise ValueError("`tactile_tokenizer_enabled=True` requires `use_tactile=True`.")
+            if not self.tactile_tokenizer_checkpoint_path or not self.tactile_tokenizer_module_root:
+                raise ValueError(
+                    "Set `tactile_tokenizer_checkpoint_path` and `tactile_tokenizer_module_root`."
+                )
+            if self.tactile_tokenizer_output not in {"global", "tokens"}:
+                raise ValueError("`tactile_tokenizer_output` must be 'global' or 'tokens'.")
         if self.tacforce_wm_enabled:
             if not self.use_tactile:
                 raise ValueError("`tacforce_wm_enabled=True` requires `use_tactile=True`.")
@@ -268,7 +384,11 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.force_shared_attention_enabled and not self.force_expert_enabled:
             raise ValueError("`force_shared_attention_enabled=True` requires `force_expert_enabled=True`.")
         if self.force_refine_enabled:
-            if not self.tacforce_wm_enabled and self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}:
+            if (
+                not self.tacforce_wm_enabled
+                and not self.tactile_tokenizer_enabled
+                and self.effort_type not in {"expert", "expert_his_c", "expert_his_t"}
+            ):
                 raise ValueError(
                     "`force_refine_enabled=True` requires a suffix force mode: "
                     "`expert`, `expert_his_c`, or `expert_his_t`."
@@ -344,6 +464,8 @@ class SmolVLAConfig(PreTrainedConfig):
             return list(range(1 - self.tacforce_wm_history_steps, last))
         if self.tacforce_wm_enabled and key in set(self.tactile_features or []):
             return list(range(1 - self.tacforce_wm_history_steps, 1))
+        if self.reference_pose_enabled and key == self.reference_pose_key:
+            return [self.reference_pose_future_delta]
         return [0]
 
     @property

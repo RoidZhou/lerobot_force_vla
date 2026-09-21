@@ -70,6 +70,7 @@ from lerobot.common.policies.normalize import (
 from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.common.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+from lerobot.common.policies.smolvla.tactile_pose import FrozenPoseNet, FrozenPoseTactileTokenizer, pose_error
 from lerobot.common.policies.tactile.encoder import TactileTokenEncoder
 from lerobot.common.policies.utils import (
     populate_queues,
@@ -329,11 +330,75 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 if effort_key != self.config.effort_key:
                     self._queues[effort_key] = deque(maxlen=effort_queue_len)
         self._force_refine_state = None
+        self._tactile_servo_integral = None
+        self._tactile_servo_filtered_error = None
+        self._tactile_servo_previous_filtered_error = None
+        self._last_tactile_servo_correction = None
         self._tacforce_tactile_queues = {
             key: deque(maxlen=self.config.tacforce_wm_history_steps)
             for key in (self.config.tactile_features or [])
         }
         self._tacforce_force_queue = deque(maxlen=self.config.tacforce_wm_history_steps)
+
+    @torch.no_grad()
+    def tactile_servo_correction(self) -> Tensor | None:
+        """Return xxx-compatible nut-local PID correction; never add it to joint actions here."""
+        error = self.model._last_pose_error
+        if not self.config.tactile_servo_enabled or error is None:
+            return None
+        if self._tactile_servo_integral is None:
+            limit = error.new_tensor(self.config.tactile_servo_integral_clip)
+            self._tactile_servo_integral = error.clone().clamp(-limit, limit)
+            self._tactile_servo_filtered_error = error.clone()
+            self._tactile_servo_previous_filtered_error = error.clone()
+            derivative = torch.zeros_like(error)
+        else:
+            self._tactile_servo_integral += error
+            limit = error.new_tensor(self.config.tactile_servo_integral_clip)
+            self._tactile_servo_integral.clamp_(-limit, limit)
+            alpha = self.config.tactile_servo_filter_alpha
+            self._tactile_servo_filtered_error = (
+                (1.0 - alpha) * self._tactile_servo_filtered_error + alpha * error
+            )
+            derivative = self._tactile_servo_filtered_error - self._tactile_servo_previous_filtered_error
+            self._tactile_servo_previous_filtered_error = self._tactile_servo_filtered_error.clone()
+        kp = error.new_tensor(self.config.tactile_servo_kp)
+        ki = error.new_tensor(self.config.tactile_servo_ki)
+        kd = error.new_tensor(self.config.tactile_servo_kd)
+        correction = kp * error + ki * self._tactile_servo_integral + kd * derivative
+        pos_norm = correction[:, :3].norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        tilt_norm = correction[:, 3:].norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        correction[:, :3] *= torch.clamp(self.config.tactile_servo_max_position_m / pos_norm, max=1.0)
+        correction[:, 3:] *= torch.clamp(self.config.tactile_servo_max_tilt_rad / tilt_norm, max=1.0)
+        self._last_tactile_servo_correction = correction.detach()
+        return correction
+
+    def _pose_tactile_tensor(self, tactile_data: list[Tensor] | None) -> Tensor | None:
+        if not self.config.posenet_enabled:
+            return None
+        if tactile_data is None or len(tactile_data) != 2:
+            raise ValueError("PoseNet requires exactly left/right tactile tensors.")
+        raw_ndim = len(self.config.tactile_raw_shape)
+        latest = [value[:, -1] if value.ndim == raw_ndim + 2 else value for value in tactile_data]
+        return torch.stack(latest, dim=1)
+
+    def prepare_reference_pose_target(self, batch: dict[str, Tensor]) -> tuple[Tensor | None, Tensor | None]:
+        if not self.config.reference_pose_enabled:
+            return None, None
+        key = self.config.reference_pose_key
+        if key not in batch:
+            raise KeyError(
+                f"Reference pose supervision is enabled but dataset field {key!r} is missing. "
+                "Add nut-local T_nut_fingertip [x,y,z,roll,pitch,yaw]."
+            )
+        target = batch[key]
+        if target.ndim == 3:
+            target = target[:, -1]
+        if target.ndim != 2 or target.shape[-1] != 6:
+            raise ValueError(f"Reference pose target must be [B,6], got {tuple(target.shape)}")
+        pad = batch.get(f"{key}_is_pad")
+        valid = None if pad is None else ~pad[:, -1].to(dtype=torch.bool)
+        return target, valid
 
     def get_optim_params(self) -> dict:
         return self.parameters()
@@ -396,7 +461,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             state = self.prepare_state(batch)
             effort = self.prepare_effort(batch)
             tactile_data = self._extract_tactile_data(batch)
-            tactile_tokens = self.model.encode_tacforce_refine_tokens(
+            pose_tactile = self._pose_tactile_tensor(tactile_data)
+            tactile_tokens = self.model.encode_tactile_tokens(
                 raw_tactile if self.config.tacforce_wm_enabled else tactile_data, raw_force
             )
             lang_tokens, lang_masks = self.prepare_language(batch)
@@ -410,6 +476,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     state,
                     effort=effort,
                     tactile_tokens=tactile_tokens,
+                    raw_pose_tactile=pose_tactile,
                     noise=noise,
                 )
             else:
@@ -428,6 +495,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+            self.tactile_servo_correction()
         return self._queues[ACTION].popleft()
 
     @torch.no_grad
@@ -454,13 +522,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         effort = self.prepare_effort(batch)
         tactile_data = self._extract_tactile_data(batch)
-        tactile_tokens = self.model.encode_tacforce_refine_tokens(
+        pose_tactile = self._pose_tactile_tensor(tactile_data)
+        tactile_tokens = self.model.encode_tactile_tokens(
             raw_tactile if self.config.tacforce_wm_enabled else tactile_data, raw_force
         )
         refined_actions = self.model.refine_actions_from_force(
             self._force_refine_state,
             effort=effort,
             tactile_tokens=tactile_tokens,
+            raw_pose_tactile=pose_tactile,
         )
 
         original_action_dim = self.config.action_feature.shape[0]
@@ -473,6 +543,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         remaining_actions = refined_actions[:, executed_steps : self.config.n_action_steps]
         self._queues[ACTION].clear()
         self._queues[ACTION].extend(remaining_actions.transpose(0, 1))
+        self.tactile_servo_correction()
         return remaining_actions
 
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> dict[str, Tensor]:
@@ -493,6 +564,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             self._debug_raw_effort_printed = True
 
         raw_future_effort, future_effort_valid = self.prepare_future_effort(batch)
+        reference_pose_target, reference_pose_valid = self.prepare_reference_pose_target(batch)
         batch = self.normalize_inputs(batch)
         self._restore_raw_effort_for_tokenizer(batch, raw_effort)
         batch = self.normalize_targets(batch)
@@ -500,7 +572,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         effort = self.prepare_effort(batch)
         tactile_data = self._extract_tactile_data(batch)
-        tactile_tokens = self.model.encode_tacforce_refine_tokens(
+        pose_tactile = self._pose_tactile_tensor(tactile_data)
+        tactile_tokens = self.model.encode_tactile_tokens(
             raw_tactile if self.config.tacforce_wm_enabled else tactile_data, raw_force
         )
         future_effort = raw_future_effort
@@ -521,6 +594,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             future_effort=future_effort,
             future_effort_valid=future_effort_valid,
             tactile_tokens=tactile_tokens,
+            raw_pose_tactile=pose_tactile,
+            reference_pose_target=reference_pose_target,
+            reference_pose_valid=reference_pose_valid,
         )
         force_prediction_loss = None
         if isinstance(model_losses, tuple):
@@ -559,10 +635,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["force_refine_loss"] = force_refine_loss.item()
             loss = loss + self.config.force_refine_loss_weight * force_refine_loss
         if force_prediction_loss is not None:
-            loss_dict["force_prediction_loss"] = force_prediction_loss.item()
-            loss = loss + self.config.force_prediction_loss_weight * force_prediction_loss
+            name = "reference_pose_loss" if self.config.reference_pose_enabled else "force_prediction_loss"
+            weight = self.config.reference_pose_loss_weight if self.config.reference_pose_enabled else self.config.force_prediction_loss_weight
+            loss_dict[name] = force_prediction_loss.item()
+            loss = loss + weight * force_prediction_loss
         if self.config.force_prediction_enabled:
             loss_dict["force_prediction_has_target"] = float(force_prediction_loss is not None)
+        if force_refine_losses is not None and self.config.tactile_refine_enabled:
+            loss_dict["tactile_refine_loss"] = loss_dict.pop("force_refine_loss")
         # For backward pass
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
@@ -919,7 +999,7 @@ class VLAFlowMatching(nn.Module):
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
-        if self.config.use_tactile and not self.config.tacforce_wm_enabled:
+        if self.config.use_tactile and not self.config.tacforce_wm_enabled and not self.config.tactile_tokenizer_enabled:
             self.tactile_encoder = TactileTokenEncoder(
                 encoder_type=self.config.tactile_encoder_type,
                 input_shape=self.config.tactile_input_shape,
@@ -936,6 +1016,24 @@ class VLAFlowMatching(nn.Module):
         else:
             self.tactile_encoder = None
             self.tactile_proj = None
+        if self.config.tactile_tokenizer_enabled:
+            self.pose_tactile_tokenizer = FrozenPoseTactileTokenizer(
+                self.config.tactile_tokenizer_checkpoint_path,
+                self.config.tactile_tokenizer_module_root,
+                sensor_grid_size=self.config.tactile_tokenizer_sensor_grid_size,
+                sensor_shape=self.config.tactile_tokenizer_sensor_shape,
+                allow_sensor_resize=self.config.tactile_tokenizer_allow_sensor_resize,
+                output=self.config.tactile_tokenizer_output,
+                frozen=self.config.freeze_tactile_tokenizer,
+            )
+            self.pose_tactile_projection = nn.Sequential(
+                nn.LayerNorm(self.pose_tactile_tokenizer.embed_dim),
+                nn.Linear(self.pose_tactile_tokenizer.embed_dim, self.vlm_with_expert.expert_hidden_size),
+                nn.SiLU(),
+            )
+        else:
+            self.pose_tactile_tokenizer = None
+            self.pose_tactile_projection = None
         if self.config.tacforce_wm_enabled:
             self.tacforce_dynamics = FrozenTacForceDynamics(
                 {
@@ -970,6 +1068,12 @@ class VLAFlowMatching(nn.Module):
             self.force_prediction_expert = copy.deepcopy(self.vlm_with_expert.lm_expert)
         else:
             self.force_prediction_expert = None
+        # Keep the old state-dict key for pretrained FR-VLA compatibility;
+        # ``tactile_expert`` below is a non-registering property alias.
+        if self.config.reference_pose_expert_enabled:
+            self.reference_pose_expert = copy.deepcopy(self.vlm_with_expert.lm_expert)
+        else:
+            self.reference_pose_expert = None
         if self.force_prediction_expert is not None:
             prediction_effort_in_dim = self.config.effort_dim
             if self.config.force_prediction_effort_type == "expert_his_c":
@@ -998,6 +1102,28 @@ class VLAFlowMatching(nn.Module):
             )
         else:
             self.force_pred_head = None
+        expert_dim = self.vlm_with_expert.expert_hidden_size
+        if self.config.reference_pose_enabled:
+            self.posenet = FrozenPoseNet(
+                self.config.posenet_checkpoint_path, self.config.posenet_module_root,
+                sensor_grid_size=self.config.posenet_sensor_grid_size,
+                sensor_shape=self.config.posenet_sensor_shape,
+                allow_sensor_resize=self.config.posenet_allow_sensor_resize,
+            )
+            self.current_pose_proj = nn.Sequential(nn.Linear(6, expert_dim), nn.SiLU(), nn.Linear(expert_dim, expert_dim))
+            self.pose_error_proj = nn.Sequential(nn.Linear(6, expert_dim), nn.SiLU(), nn.Linear(expert_dim, expert_dim))
+            self.reference_pose_head = nn.Sequential(
+                nn.LayerNorm(expert_dim), nn.Linear(expert_dim, expert_dim), nn.SiLU(),
+                nn.Linear(expert_dim, self.config.reference_pose_dim),
+            )
+        else:
+            self.posenet = None
+            self.current_pose_proj = None
+            self.pose_error_proj = None
+            self.reference_pose_head = None
+        self._last_current_tactile_pose = None
+        self._last_reference_pose = None
+        self._last_pose_error = None
         self._last_predicted_force = None
         self.force_vqvae = None
         self.force_code_embedder = None
@@ -1063,6 +1189,10 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
 
+    @property
+    def tactile_expert(self):
+        return self.force_expert
+
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
@@ -1077,6 +1207,15 @@ class VLAFlowMatching(nn.Module):
         if self.force_expert is not None:
             for params in self.force_expert.parameters():
                 params.requires_grad = self.config.train_force_expert
+        if self.reference_pose_expert is not None:
+            for params in self.reference_pose_expert.parameters():
+                params.requires_grad = self.config.train_reference_pose_expert
+            for module in (self.current_pose_proj, self.pose_error_proj, self.reference_pose_head):
+                for params in module.parameters():
+                    params.requires_grad = self.config.train_reference_pose_expert
+        if self.posenet is not None:
+            for params in self.posenet.parameters():
+                params.requires_grad = not self.config.freeze_posenet
         if self.force_prediction_expert is not None:
             for params in self.force_prediction_expert.parameters():
                 params.requires_grad = self.config.train_force_prediction_expert
@@ -1100,6 +1239,11 @@ class VLAFlowMatching(nn.Module):
             for module in (self.tacforce_current_proj, self.tacforce_future_proj, self.tacforce_cross_attention):
                 for params in module.parameters():
                     params.requires_grad = train_bridge
+        if self.pose_tactile_tokenizer is not None:
+            for params in self.pose_tactile_tokenizer.parameters():
+                params.requires_grad = not self.config.freeze_tactile_tokenizer
+            for params in self.pose_tactile_projection.parameters():
+                params.requires_grad = self.config.train_tactile_projection
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -1415,9 +1559,17 @@ class VLAFlowMatching(nn.Module):
         tactile = torch.cat(packed_hands, dim=-1)
         return torch.cat([tactile, tactile[:, :, -1:]], dim=2)
 
-    def encode_tacforce_refine_tokens(
+    def encode_tactile_tokens(
         self, tactile_data: list[Tensor] | None, force_history: Tensor | None
     ) -> Tensor | None:
+        if self.config.tactile_tokenizer_enabled:
+            if tactile_data is None or len(tactile_data) != 2:
+                raise ValueError("PoseNet TactileTokenizer requires left/right current tactile frames.")
+            raw_ndim = len(self.config.tactile_raw_shape)
+            latest = [value[:, -1] if value.ndim == raw_ndim + 2 else value for value in tactile_data]
+            raw_tactile = torch.stack(latest, dim=1)
+            frozen_tokens = self.pose_tactile_tokenizer(raw_tactile)
+            return self.pose_tactile_projection(frozen_tokens)
         if not self.config.tacforce_wm_enabled:
             if not self.config.use_tactile:
                 return None
@@ -1433,7 +1585,7 @@ class VLAFlowMatching(nn.Module):
             "force_4x": torch.repeat_interleave(force_history.float(), self.config.tacforce_wm_force_upsample, dim=1),
         }
         with torch.no_grad():
-            latent = self.tacforce_dynamics(obs, compute_predict=True)
+            latent = self.tacforce_dynamics(obs, compute_predict=not self.config.tactile_tokenizer_only)
         # TacForce-WM is trained by _build_chunk_sample on
         #   input  = z[:, :chunk_horizon]
         #   target = z[:, future_shift:future_shift + chunk_horizon].
@@ -1441,6 +1593,9 @@ class VLAFlowMatching(nn.Module):
         # supervised.  Do not expose the unsupervised tail to the VLA expert.
         supervised_steps = int(self.tacforce_dynamics.wm.chunk_horizon)
         current_latent = latent["tactile_latent_curr"]
+        if self.config.tactile_tokenizer_only:
+            # Frozen pretrained TactileTokenizer -> trainable linear projection.
+            return self.tacforce_current_proj(current_latent)
         future_latent = latent["tactile_latent_future"]
         if current_latent.shape[1] < supervised_steps or future_latent.shape[1] < supervised_steps:
             raise ValueError(
@@ -1452,7 +1607,15 @@ class VLAFlowMatching(nn.Module):
         future = self.tacforce_future_proj(future_latent[:, :supervised_steps])
         return self.tacforce_cross_attention(current, future)
 
-    def embed_tactile_refine_suffix(self, tactile_tokens: Tensor | None, x_t: Tensor, timestep: Tensor):
+    def encode_tacforce_refine_tokens(
+        self, tactile_data: list[Tensor] | None, force_history: Tensor | None
+    ) -> Tensor | None:
+        """Legacy API retained for older callers."""
+        return self.encode_tactile_tokens(tactile_data, force_history)
+
+    def embed_tactile_refine_suffix(
+        self, tactile_tokens: Tensor | None, x_t: Tensor, timestep: Tensor, pose_error_token: Tensor | None = None
+    ):
         """Embed precomputed TacForce cross-attention tokens plus x_t/time tokens."""
         if not self.config.use_tactile:
             return self.embed_suffix(x_t, timestep, effort=None)
@@ -1467,6 +1630,11 @@ class VLAFlowMatching(nn.Module):
         embs.append(tactile_tokens)
         pad_masks.append(torch.ones(bsize, n_tactile_tokens, dtype=torch.bool, device=tactile_tokens.device))
         att_masks.extend([True] * n_tactile_tokens)
+        if pose_error_token is not None:
+            pose_emb = self.pose_error_proj(pose_error_token)[:, None, :].to(dtype=tactile_tokens.dtype)
+            embs.append(pose_emb)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=tactile_tokens.device))
+            att_masks.append(True)
 
         action_emb = self.action_in_proj(x_t)
         device = action_emb.device
@@ -1496,6 +1664,89 @@ class VLAFlowMatching(nn.Module):
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
+
+    def predict_current_tactile_pose(self, raw_tactile: Tensor) -> Tensor:
+        if self.posenet is None:
+            raise RuntimeError("PoseNet is not enabled.")
+        if raw_tactile.ndim >= 5 and raw_tactile.shape[1] != 2:
+            raw_tactile = raw_tactile[:, -1]
+        current = self.posenet(raw_tactile)
+        self._last_current_tactile_pose = current.detach()
+        return current
+
+    def embed_reference_pose_suffix(
+        self, tactile_tokens: Tensor, current_pose: Tensor, x_t: Tensor, timestep: Tensor
+    ):
+        embs, pads, atts = self.embed_tactile_refine_suffix(tactile_tokens, x_t, timestep)
+        pose_emb = self.current_pose_proj(current_pose)[:, None, :].to(dtype=embs.dtype)
+        # Put P_t alongside tactile condition and before action/time tokens.
+        split = embs.shape[1] - self.config.chunk_size
+        embs = torch.cat((embs[:, :split], pose_emb, embs[:, split:]), dim=1)
+        pads = torch.cat((pads[:, :split], torch.ones_like(pads[:, :1]), pads[:, split:]), dim=1)
+        atts = torch.cat((atts[:, :split], torch.ones_like(atts[:, :1]), atts[:, split:]), dim=1)
+        return embs, pads, atts
+
+    def forward_reference_pose_from_action_cache(
+        self, context_pad_masks, context_cache, x_t, timestep, tactile_tokens, current_pose
+    ) -> Tensor:
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_reference_pose_suffix(
+            tactile_tokens, current_pose, x_t, timestep
+        )
+        suffix_len, batch_size = suffix_pad_masks.shape[1], suffix_pad_masks.shape[0]
+        context_mask = context_pad_masks[:, None, :].expand(batch_size, suffix_len, context_pad_masks.shape[1])
+        att_mask = torch.cat((context_mask, make_att_2d_masks(suffix_pad_masks, suffix_att_masks)), dim=2)
+        offsets = torch.sum(context_pad_masks, dim=-1)[:, None]
+        position_ids = offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        (_, output), _ = self.vlm_with_expert.forward(
+            attention_mask=att_mask, position_ids=position_ids, past_key_values=context_cache,
+            inputs_embeds=[None, suffix_embs], use_cache=True, fill_kv_cache=False,
+            expert_model=self.reference_pose_expert,
+        )
+        return self._reference_pose_from_suffix_output(output, current_pose)
+
+    def _reference_pose_from_suffix_output(self, output: Tensor, current_pose: Tensor) -> Tensor:
+        condition_len = output.shape[1] - self.config.chunk_size
+        hidden = output[:, :condition_len].to(torch.float32).mean(dim=1)
+        selected = self.reference_pose_head(hidden)
+        if self.config.reference_pose_indices is None:
+            reference = selected
+        else:
+            # Non-predicted axes retain P_t; selected axes keep xxx's coordinate definitions.
+            reference = current_pose.clone()
+            reference[:, self.config.reference_pose_indices] = selected
+        self._last_reference_pose = reference.detach()
+        return reference
+
+    def forward_reference_pose_direct(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        x_t: Tensor,
+        timestep: Tensor,
+        tactile_tokens: Tensor,
+        current_pose: Tensor,
+    ) -> Tensor:
+        """Run the independent Reference Pose Expert on the original FR-VLA non-shared path."""
+        if self.reference_pose_expert is None:
+            raise RuntimeError("Reference pose prediction requires `reference_pose_expert_enabled=True`.")
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_reference_pose_suffix(
+            tactile_tokens, current_pose, x_t, timestep
+        )
+        pad_masks = torch.cat((prefix_pad_masks, suffix_pad_masks), dim=1)
+        att_masks = torch.cat((prefix_att_masks, suffix_att_masks), dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, output), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs.detach(), suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+            expert_model=self.reference_pose_expert,
+        )
+        return self._reference_pose_from_suffix_output(output, current_pose)
 
     def embed_force_prediction_suffix(self, noisy_actions, timestep, effort: torch.Tensor = None):
         """Embed raw force history plus action/time tokens for the force prediction expert."""
@@ -1566,6 +1817,9 @@ class VLAFlowMatching(nn.Module):
         future_effort=None,
         future_effort_valid=None,
         tactile_tokens=None,
+        raw_pose_tactile=None,
+        reference_pose_target=None,
+        reference_pose_valid=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -1578,7 +1832,8 @@ class VLAFlowMatching(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state, effort=effort
+            images, img_masks, lang_tokens, lang_masks, state=state,
+            effort=None if self.config.tactile_refine_enabled else effort,
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, effort=None)
 
@@ -1610,16 +1865,44 @@ class VLAFlowMatching(nn.Module):
             actions,
             effort=effort,
             tactile_tokens=tactile_tokens,
+            raw_pose_tactile=raw_pose_tactile,
             noise=noise,
             return_force_pred=True,
         )
-        force_refine_losses, force_pred = force_refine_out
-        force_prediction_loss = None
-        if self.force_pred_head is not None and force_pred is not None and future_effort is not None:
+        tactile_refine_losses, ref_pose_pred = force_refine_out
+        ref_pose_prediction_loss = None
+        if self.config.reference_pose_enabled:
+            if reference_pose_target is None:
+                raise ValueError("Reference Pose Expert training requires reference_pose_target.")
+            reference_pose_target = reference_pose_target.to(ref_pose_pred)
+            full_error = pose_error(ref_pose_pred, reference_pose_target)
+            selected = self.config.reference_pose_indices
+            position_indices = [0, 1, 2] if selected is None else [i for i in selected if i < 3]
+            rotation_indices = [0, 1, 2] if selected is None else [i - 3 for i in selected if i >= 3]
+            pos_per_sample = F.smooth_l1_loss(
+                ref_pose_pred[:, position_indices], reference_pose_target[:, position_indices],
+                beta=self.config.reference_pose_smooth_l1_beta, reduction="none",
+            ).mean(-1)
+            rotation_error_selected = full_error[:, [i + 3 for i in rotation_indices]]
+            rot_per_sample = F.smooth_l1_loss(
+                rotation_error_selected,
+                torch.zeros_like(rotation_error_selected),
+                beta=self.config.reference_pose_smooth_l1_beta, reduction="none",
+            ).mean(-1)
+            valid = torch.ones_like(pos_per_sample) if reference_pose_valid is None else reference_pose_valid.to(pos_per_sample)
+            denominator = valid.sum().clamp_min(1.0)
+            pos_loss = (pos_per_sample * valid).sum() / denominator
+            rot_loss = (rot_per_sample * valid).sum() / denominator
+            ref_pose_prediction_loss = (
+                self.config.reference_pose_position_weight * pos_loss
+                + self.config.reference_pose_rotation_weight * rot_loss
+            )
+            return losses, tactile_refine_losses, ref_pose_prediction_loss
+        if self.force_pred_head is not None and ref_pose_pred is not None and future_effort is not None:
             if not hasattr(self, "_debug_force_pred_printed"):
                 with torch.no_grad():
                     debug_future = future_effort.detach()
-                    debug_pred = force_pred.detach()
+                    debug_pred = ref_pose_pred.detach()
                     if debug_future.ndim == 3:
                         print("future_effort seq mean:", debug_future.mean(dim=(0, 1)).cpu())
                         print("future_effort seq min:", debug_future.amin(dim=(0, 1)).cpu())
@@ -1631,9 +1914,9 @@ class VLAFlowMatching(nn.Module):
                     print("future_effort pooled mean:", debug_future_pooled.mean(dim=0).cpu())
                     print("future_effort pooled min:", debug_future_pooled.amin(dim=0).cpu())
                     print("future_effort pooled max:", debug_future_pooled.amax(dim=0).cpu())
-                    print("force_pred mean:", debug_pred.mean(dim=0).cpu())
-                    print("force_pred min:", debug_pred.amin(dim=0).cpu())
-                    print("force_pred max:", debug_pred.amax(dim=0).cpu())
+                    print("ref_pose_pred mean:", debug_pred.mean(dim=0).cpu())
+                    print("forceref_pose_pred_pred min:", debug_pred.amin(dim=0).cpu())
+                    print("ref_pose_pred max:", debug_pred.amax(dim=0).cpu())
                 self._debug_force_pred_printed = True
 
             if future_effort.ndim == 3:
@@ -1644,9 +1927,9 @@ class VLAFlowMatching(nn.Module):
                         device=future_effort.device, dtype=future_effort.dtype
                     ).unsqueeze(-1)
                     future_effort = (future_effort * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
-            future_effort = future_effort.to(device=force_pred.device, dtype=force_pred.dtype)
-            force_prediction_loss = F.smooth_l1_loss(force_pred, future_effort, reduction="mean")
-        return losses, force_refine_losses, force_prediction_loss
+            future_effort = future_effort.to(device=ref_pose_pred.device, dtype=ref_pose_pred.dtype)
+            force_prediction_loss = F.smooth_l1_loss(ref_pose_pred, future_effort, reduction="mean")
+        return losses, tactile_refine_losses, ref_pose_prediction_loss
 
     def forward_force_refine(
         self,
@@ -1656,6 +1939,7 @@ class VLAFlowMatching(nn.Module):
         actions,
         effort=None,
         tactile_tokens=None,
+        raw_pose_tactile=None,
         noise=None,
         return_force_pred: bool = False,
     ) -> Tensor:
@@ -1680,17 +1964,35 @@ class VLAFlowMatching(nn.Module):
                 x_t,
                 time,
             )
+            current_pose = None
+            reference_pose = None
+            pose_err = None
+            if self.config.reference_pose_enabled:
+                if raw_pose_tactile is None:
+                    raise ValueError("PoseNet tactile input is required for tactile refinement.")
+                current_pose = self.predict_current_tactile_pose(raw_pose_tactile)
+                reference_pose = self.forward_reference_pose_from_action_cache(
+                    action_context_pad_masks, self._detach_cache(action_context_cache),
+                    x_t.detach(), time.detach(), tactile_tokens, current_pose,
+                )
+                pose_err = pose_error(current_pose, reference_pose)
+                self._last_pose_error = pose_err.detach()
+                if self.config.reference_pose_detach_for_refine:
+                    pose_err = pose_err.detach()
             force_suffix_out = self.forward_force_from_action_cache(
                 action_context_pad_masks,
                 action_context_cache,
                 x_t,
                 time,
                 tactile_tokens=tactile_tokens,
+                pose_error_token=pose_err,
             )
             refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
             force_v_t = self.force_refine_out_proj(refine_hidden)
             force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
-            if self.force_prediction_expert is not None:
+            if self.config.reference_pose_enabled:
+                force_pred = reference_pose
+            elif self.force_prediction_expert is not None:
                 force_pred = self.predict_force_from_action_cache(
                     action_context_pad_masks,
                     action_context_cache,
@@ -1704,8 +2006,29 @@ class VLAFlowMatching(nn.Module):
                 return force_refine_losses, force_pred
             return force_refine_losses
 
+        current_pose = None
+        reference_pose = None
+        pose_err = None
+        if self.config.reference_pose_enabled:
+            if raw_pose_tactile is None:
+                raise ValueError("PoseNet tactile input is required for tactile refinement.")
+            current_pose = self.predict_current_tactile_pose(raw_pose_tactile)
+            reference_pose = self.forward_reference_pose_direct(
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+                x_t.detach(),
+                time.detach(),
+                tactile_tokens,
+                current_pose,
+            )
+            pose_err = pose_error(current_pose, reference_pose)
+            self._last_pose_error = pose_err.detach()
+            if self.config.reference_pose_detach_for_refine:
+                pose_err = pose_err.detach()
+
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_tactile_refine_suffix(
-            tactile_tokens, x_t, time
+            tactile_tokens, x_t, time, pose_error_token=pose_err
         )
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -1725,7 +2048,9 @@ class VLAFlowMatching(nn.Module):
         refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
         force_v_t = self.force_refine_out_proj(refine_hidden)
         force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
-        if self.force_prediction_expert is not None:
+        if self.config.reference_pose_enabled:
+            ref_pose_pred = reference_pose
+        elif self.force_prediction_expert is not None:
             force_pred = self.predict_force_direct(
                 prefix_embs,
                 prefix_pad_masks,
@@ -1737,7 +2062,7 @@ class VLAFlowMatching(nn.Module):
         else:
             force_pred = self.predict_force_from_suffix(force_suffix_out, detach_hidden=True)
         if return_force_pred:
-            return force_refine_losses, force_pred
+            return force_refine_losses, ref_pose_pred
         return force_refine_losses
 
     def pool_force_hidden(self, force_suffix_out: Tensor) -> Tensor:
@@ -1856,13 +2181,14 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
         tactile_tokens=None,
+        pose_error_token=None,
     ) -> Tensor:
         """Run force expert on fresh tactile tokens while attending cached [latent | action] KV."""
         if self.force_expert is None:
             raise RuntimeError("Force-cache refinement requires `force_expert_enabled=True`.")
 
         force_suffix_embs, force_suffix_pad_masks, force_suffix_att_masks = self.embed_tactile_refine_suffix(
-            tactile_tokens, x_t, timestep
+            tactile_tokens, x_t, timestep, pose_error_token=pose_error_token
         )
 
         force_len = force_suffix_pad_masks.shape[1]
@@ -1974,7 +2300,8 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state, effort=effort
+            images, img_masks, lang_tokens, lang_masks, state=state,
+            effort=None if self.config.tactile_refine_enabled else effort,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -2007,7 +2334,8 @@ class VLAFlowMatching(nn.Module):
         return x_t
 
     def sample_actions_for_force_refine(
-        self, images, img_masks, lang_tokens, lang_masks, state, effort=None, tactile_tokens=None, noise=None
+        self, images, img_masks, lang_tokens, lang_masks, state, effort=None, tactile_tokens=None,
+        raw_pose_tactile=None, noise=None
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Run the slow split stage and immediately refine once with the current force.
 
@@ -2021,7 +2349,8 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state, effort=effort
+            images, img_masks, lang_tokens, lang_masks, state=state,
+            effort=None if self.config.tactile_refine_enabled else effort,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -2060,10 +2389,15 @@ class VLAFlowMatching(nn.Module):
             "x_split": x_t.detach(),
             "tau_split": time.detach(),
         }
-        if self.force_prediction_expert is not None and not self.config.force_shared_attention_enabled:
+        if (
+            (self.force_prediction_expert is not None or self.config.reference_pose_enabled)
+            and not self.config.force_shared_attention_enabled
+        ):
             refine_state["prefix_embs"] = prefix_embs.detach()
             refine_state["prefix_att_masks"] = prefix_att_masks
-        actions = self.refine_actions_from_force(refine_state, effort=effort, tactile_tokens=tactile_tokens)
+        actions = self.refine_actions_from_force(
+            refine_state, effort=effort, tactile_tokens=tactile_tokens, raw_pose_tactile=raw_pose_tactile
+        )
         return actions, refine_state
 
     def refine_actions_from_force(
@@ -2071,6 +2405,7 @@ class VLAFlowMatching(nn.Module):
         refine_state: dict[str, Tensor],
         effort=None,
         tactile_tokens=None,
+        raw_pose_tactile=None,
     ) -> Tensor:
         """Continue the lower flow segment from cached x_split using a fresh tactile condition."""
         prefix_pad_masks = refine_state["prefix_pad_masks"]
@@ -2082,6 +2417,25 @@ class VLAFlowMatching(nn.Module):
         device = x_t.device
         dt = torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32, device=device)
         remaining_steps = self.config.num_steps - self.config.force_refine_split_step
+        pose_err = None
+        if self.config.reference_pose_enabled:
+            if raw_pose_tactile is None:
+                raise ValueError("PoseNet tactile input is required during inference.")
+            current_pose = self.predict_current_tactile_pose(raw_pose_tactile)
+            if self.config.force_shared_attention_enabled:
+                reference_pose = self.forward_reference_pose_from_action_cache(
+                    prefix_pad_masks, self._detach_cache(past_key_values), x_t.detach(),
+                    time.expand(bsize).detach(), tactile_tokens, current_pose,
+                )
+            else:
+                reference_pose = self.forward_reference_pose_direct(
+                    refine_state["prefix_embs"], prefix_pad_masks, refine_state["prefix_att_masks"],
+                    x_t.detach(), time.expand(bsize).detach(), tactile_tokens, current_pose,
+                )
+            pose_err = pose_error(current_pose, reference_pose)
+            self._last_pose_error = pose_err.detach()
+            if self.config.reference_pose_detach_for_refine:
+                pose_err = pose_err.detach()
         if self.force_prediction_expert is not None:
             if self.config.force_shared_attention_enabled:
                 self.predict_force_from_action_cache(
@@ -2110,6 +2464,7 @@ class VLAFlowMatching(nn.Module):
                 effort,
                 tactile_tokens=tactile_tokens,
                 force_refine=True,
+                pose_error_token=pose_err,
             )
             x_t += dt * v_t
             time += dt
@@ -2124,6 +2479,7 @@ class VLAFlowMatching(nn.Module):
         effort=None,
         tactile_tokens=None,
         force_refine: bool = False,
+        pose_error_token=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         if force_refine and self.force_refine_out_proj is None:
@@ -2135,6 +2491,7 @@ class VLAFlowMatching(nn.Module):
                 x_t,
                 timestep,
                 tactile_tokens=tactile_tokens,
+                pose_error_token=pose_error_token,
             )
             if self.force_prediction_expert is None:
                 self.predict_force_from_suffix(force_suffix_out)
@@ -2143,7 +2500,7 @@ class VLAFlowMatching(nn.Module):
 
         if force_refine:
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_tactile_refine_suffix(
-                tactile_tokens, x_t, timestep
+                tactile_tokens, x_t, timestep, pose_error_token=pose_error_token
             )
         else:
             suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep, effort=effort)
