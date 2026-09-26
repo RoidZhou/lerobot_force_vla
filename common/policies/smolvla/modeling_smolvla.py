@@ -346,6 +346,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         error = self.model._last_pose_error
         if not self.config.tactile_servo_enabled or error is None:
             return None
+        authority = self.model._last_tactile_soft_gate
+        if authority is None:
+            authority = self.model._last_pose_confidence
+        if authority is not None:
+            authority = authority.to(error).clamp(0.0, 1.0)
         if self._tactile_servo_integral is None:
             limit = error.new_tensor(self.config.tactile_servo_integral_clip)
             self._tactile_servo_integral = error.clone().clamp(-limit, limit)
@@ -366,6 +371,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         ki = error.new_tensor(self.config.tactile_servo_ki)
         kd = error.new_tensor(self.config.tactile_servo_kd)
         correction = kp * error + ki * self._tactile_servo_integral + kd * derivative
+        if authority is not None:
+            correction = correction * authority
         pos_norm = correction[:, :3].norm(dim=-1, keepdim=True).clamp_min(1e-12)
         tilt_norm = correction[:, 3:].norm(dim=-1, keepdim=True).clamp_min(1e-12)
         correction[:, :3] *= torch.clamp(self.config.tactile_servo_max_position_m / pos_norm, max=1.0)
@@ -398,6 +405,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise ValueError(f"Reference pose target must be [B,6], got {tuple(target.shape)}")
         pad = batch.get(f"{key}_is_pad")
         valid = None if pad is None else ~pad[:, -1].to(dtype=torch.bool)
+        if self.config.tactile_soft_gate_enabled:
+            confidence_key = self.config.pose_confidence_key
+            if confidence_key not in batch:
+                raise KeyError(
+                    f"Soft tactile gating requires dataset field {confidence_key!r}."
+                )
+            confidence_valid = batch[confidence_key]
+            if confidence_valid.ndim == 3:
+                confidence_valid = confidence_valid[:, -1]
+            confidence_valid = confidence_valid.reshape(confidence_valid.shape[0], -1)[:, 0] >= 0.5
+            valid = confidence_valid if valid is None else (valid & confidence_valid)
         return target, valid
 
     def get_optim_params(self) -> dict:
@@ -1110,20 +1128,47 @@ class VLAFlowMatching(nn.Module):
                 sensor_shape=self.config.posenet_sensor_shape,
                 allow_sensor_resize=self.config.posenet_allow_sensor_resize,
             )
+            if self.config.tactile_soft_gate_enabled and not self.posenet.predicts_confidence:
+                raise ValueError(
+                    "Soft tactile gating requires a PoseNet checkpoint trained with "
+                    "predict_confidence=True."
+                )
             self.current_pose_proj = nn.Sequential(nn.Linear(6, expert_dim), nn.SiLU(), nn.Linear(expert_dim, expert_dim))
             self.pose_error_proj = nn.Sequential(nn.Linear(6, expert_dim), nn.SiLU(), nn.Linear(expert_dim, expert_dim))
             self.reference_pose_head = nn.Sequential(
                 nn.LayerNorm(expert_dim), nn.Linear(expert_dim, expert_dim), nn.SiLU(),
                 nn.Linear(expert_dim, self.config.reference_pose_dim),
             )
+            if self.config.tactile_soft_gate_enabled:
+                gate_hidden = self.config.tactile_soft_gate_hidden_dim
+                visual_dim = self.vlm_with_expert.config.text_config.hidden_size
+                self.soft_gate_visual_proj = nn.Sequential(
+                    nn.LayerNorm(visual_dim), nn.Linear(visual_dim, gate_hidden), nn.SiLU()
+                )
+                self.soft_gate_tactile_proj = nn.Sequential(
+                    nn.LayerNorm(expert_dim), nn.Linear(expert_dim, gate_hidden), nn.SiLU()
+                )
+                self.soft_gate_mlp = nn.Sequential(
+                    nn.Linear(2 * gate_hidden + 1, gate_hidden), nn.SiLU(),
+                    nn.Linear(gate_hidden, 1),
+                )
+            else:
+                self.soft_gate_visual_proj = None
+                self.soft_gate_tactile_proj = None
+                self.soft_gate_mlp = None
         else:
             self.posenet = None
             self.current_pose_proj = None
             self.pose_error_proj = None
             self.reference_pose_head = None
+            self.soft_gate_visual_proj = None
+            self.soft_gate_tactile_proj = None
+            self.soft_gate_mlp = None
         self._last_current_tactile_pose = None
         self._last_reference_pose = None
         self._last_pose_error = None
+        self._last_pose_confidence = None
+        self._last_tactile_soft_gate = None
         self._last_predicted_force = None
         self.force_vqvae = None
         self.force_code_embedder = None
@@ -1213,6 +1258,14 @@ class VLAFlowMatching(nn.Module):
             for module in (self.current_pose_proj, self.pose_error_proj, self.reference_pose_head):
                 for params in module.parameters():
                     params.requires_grad = self.config.train_reference_pose_expert
+        if self.soft_gate_mlp is not None:
+            for module in (
+                self.soft_gate_visual_proj,
+                self.soft_gate_tactile_proj,
+                self.soft_gate_mlp,
+            ):
+                for params in module.parameters():
+                    params.requires_grad = True
         if self.posenet is not None:
             for params in self.posenet.parameters():
                 params.requires_grad = not self.config.freeze_posenet
@@ -1666,13 +1719,94 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def predict_current_tactile_pose(self, raw_tactile: Tensor) -> Tensor:
+        current, _ = self.predict_current_tactile_pose_and_confidence(raw_tactile)
+        return current
+
+    def predict_current_tactile_pose_and_confidence(
+        self, raw_tactile: Tensor
+    ) -> tuple[Tensor, Tensor]:
         if self.posenet is None:
             raise RuntimeError("PoseNet is not enabled.")
         if raw_tactile.ndim >= 5 and raw_tactile.shape[1] != 2:
             raw_tactile = raw_tactile[:, -1]
-        current = self.posenet(raw_tactile)
+        current, confidence = self.posenet.forward_with_confidence(raw_tactile)
         self._last_current_tactile_pose = current.detach()
-        return current
+        self._last_pose_confidence = confidence.detach()
+        return current, confidence
+
+    @staticmethod
+    def _masked_token_mean(tokens: Tensor, mask: Tensor) -> Tensor:
+        weight = mask.to(dtype=tokens.dtype).unsqueeze(-1)
+        return (tokens * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
+
+    def compute_tactile_soft_gate(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        tactile_tokens: Tensor,
+        pose_confidence: Tensor,
+    ) -> Tensor:
+        """Return g in [0,1], with confidence enforcing zero tactile authority."""
+        if not self.config.tactile_soft_gate_enabled:
+            return torch.ones_like(pose_confidence)
+        visual = self._masked_token_mean(prefix_embs, prefix_pad_masks).float()
+        tactile = tactile_tokens.float().mean(dim=1)
+        confidence = pose_confidence.float().clamp(0.0, 1.0)
+        learned = torch.sigmoid(
+            self.soft_gate_mlp(
+                torch.cat(
+                    (
+                        self.soft_gate_visual_proj(visual),
+                        self.soft_gate_tactile_proj(tactile),
+                        confidence,
+                    ),
+                    dim=-1,
+                )
+            )
+        )
+        gate = confidence * learned
+        self._last_tactile_soft_gate = gate.detach()
+        return gate
+
+    def blend_action_tactile_velocity(
+        self, action_velocity: Tensor, tactile_velocity: Tensor, gate: Tensor
+    ) -> Tensor:
+        blend = gate.to(action_velocity)[:, None, :]
+        gripper_index = self.config.tactile_soft_gate_gripper_index
+        if gripper_index >= action_velocity.shape[-1]:
+            raise ValueError(
+                f"Gripper index {gripper_index} exceeds action dimension {action_velocity.shape[-1]}."
+            )
+        # The gripper is never tactile-refined, regardless of confidence/gate.
+        action_mask = torch.ones_like(action_velocity)
+        action_mask[..., gripper_index] = 0.0
+        return action_velocity + blend * (tactile_velocity - action_velocity) * action_mask
+
+    def forward_action_velocity_direct(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        x_t: Tensor,
+        timestep: Tensor,
+    ) -> Tensor:
+        """Action Expert velocity at the same lower-flow state as Tactile Expert."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            x_t, timestep, effort=None
+        )
+        pad_masks = torch.cat((prefix_pad_masks, suffix_pad_masks), dim=1)
+        att_masks = torch.cat((prefix_att_masks, suffix_att_masks), dim=1)
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=make_att_2d_masks(pad_masks, att_masks),
+            position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        return self.action_out_proj(
+            suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
+        )
 
     def embed_reference_pose_suffix(
         self, tactile_tokens: Tensor, current_pose: Tensor, x_t: Tensor, timestep: Tensor
@@ -1967,15 +2101,27 @@ class VLAFlowMatching(nn.Module):
             current_pose = None
             reference_pose = None
             pose_err = None
+            pose_confidence = None
+            soft_gate = None
+            gated_tactile_tokens = tactile_tokens
             if self.config.reference_pose_enabled:
                 if raw_pose_tactile is None:
                     raise ValueError("PoseNet tactile input is required for tactile refinement.")
-                current_pose = self.predict_current_tactile_pose(raw_pose_tactile)
+                current_pose, pose_confidence = self.predict_current_tactile_pose_and_confidence(
+                    raw_pose_tactile
+                )
+                if self.config.tactile_soft_gate_enabled:
+                    soft_gate = self.compute_tactile_soft_gate(
+                        prefix_embs, prefix_pad_masks, tactile_tokens, pose_confidence
+                    )
+                    gated_tactile_tokens = tactile_tokens * soft_gate[:, None, :].to(tactile_tokens)
                 reference_pose = self.forward_reference_pose_from_action_cache(
                     action_context_pad_masks, self._detach_cache(action_context_cache),
-                    x_t.detach(), time.detach(), tactile_tokens, current_pose,
+                    x_t.detach(), time.detach(), gated_tactile_tokens, current_pose,
                 )
                 pose_err = pose_error(current_pose, reference_pose)
+                if self.config.tactile_soft_gate_enabled:
+                    pose_err = pose_err * pose_confidence.to(pose_err)
                 self._last_pose_error = pose_err.detach()
                 if self.config.reference_pose_detach_for_refine:
                     pose_err = pose_err.detach()
@@ -1984,11 +2130,18 @@ class VLAFlowMatching(nn.Module):
                 action_context_cache,
                 x_t,
                 time,
-                tactile_tokens=tactile_tokens,
+                tactile_tokens=gated_tactile_tokens,
                 pose_error_token=pose_err,
             )
             refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
             force_v_t = self.force_refine_out_proj(refine_hidden)
+            if self.config.tactile_soft_gate_enabled:
+                action_v_t = self.forward_action_velocity_direct(
+                    prefix_embs, prefix_pad_masks, prefix_att_masks, x_t, time
+                ).detach()
+                force_v_t = self.blend_action_tactile_velocity(
+                    action_v_t, force_v_t, soft_gate
+                )
             force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
             if self.config.reference_pose_enabled:
                 force_pred = reference_pose
@@ -2009,26 +2162,38 @@ class VLAFlowMatching(nn.Module):
         current_pose = None
         reference_pose = None
         pose_err = None
+        pose_confidence = None
+        soft_gate = None
+        gated_tactile_tokens = tactile_tokens
         if self.config.reference_pose_enabled:
             if raw_pose_tactile is None:
                 raise ValueError("PoseNet tactile input is required for tactile refinement.")
-            current_pose = self.predict_current_tactile_pose(raw_pose_tactile)
+            current_pose, pose_confidence = self.predict_current_tactile_pose_and_confidence(
+                raw_pose_tactile
+            )
+            if self.config.tactile_soft_gate_enabled:
+                soft_gate = self.compute_tactile_soft_gate(
+                    prefix_embs, prefix_pad_masks, tactile_tokens, pose_confidence
+                )
+                gated_tactile_tokens = tactile_tokens * soft_gate[:, None, :].to(tactile_tokens)
             reference_pose = self.forward_reference_pose_direct(
                 prefix_embs,
                 prefix_pad_masks,
                 prefix_att_masks,
                 x_t.detach(),
                 time.detach(),
-                tactile_tokens,
+                gated_tactile_tokens,
                 current_pose,
             )
             pose_err = pose_error(current_pose, reference_pose)
+            if self.config.tactile_soft_gate_enabled:
+                pose_err = pose_err * pose_confidence.to(pose_err)
             self._last_pose_error = pose_err.detach()
             if self.config.reference_pose_detach_for_refine:
                 pose_err = pose_err.detach()
 
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_tactile_refine_suffix(
-            tactile_tokens, x_t, time, pose_error_token=pose_err
+            gated_tactile_tokens, x_t, time, pose_error_token=pose_err
         )
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -2047,6 +2212,13 @@ class VLAFlowMatching(nn.Module):
         force_suffix_out = force_suffix_out.to(dtype=torch.float32)
         refine_hidden = force_suffix_out[:, -self.config.chunk_size :]
         force_v_t = self.force_refine_out_proj(refine_hidden)
+        if self.config.tactile_soft_gate_enabled:
+            action_v_t = self.forward_action_velocity_direct(
+                prefix_embs, prefix_pad_masks, prefix_att_masks, x_t, time
+            ).detach()
+            force_v_t = self.blend_action_tactile_velocity(
+                action_v_t, force_v_t, soft_gate
+            )
         force_refine_losses = F.mse_loss(u_t, force_v_t, reduction="none")
         if self.config.reference_pose_enabled:
             ref_pose_pred = reference_pose
@@ -2362,6 +2534,7 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
+        action_past_key_values = past_key_values
 
         dt = torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32, device=device)
         x_t = noise
@@ -2388,6 +2561,8 @@ class VLAFlowMatching(nn.Module):
             "past_key_values": past_key_values,
             "x_split": x_t.detach(),
             "tau_split": time.detach(),
+            "action_past_key_values": action_past_key_values,
+            "action_prefix_pad_masks": prefix_pad_masks,
         }
         if (
             (self.force_prediction_expert is not None or self.config.reference_pose_enabled)
@@ -2395,6 +2570,9 @@ class VLAFlowMatching(nn.Module):
         ):
             refine_state["prefix_embs"] = prefix_embs.detach()
             refine_state["prefix_att_masks"] = prefix_att_masks
+        if self.config.tactile_soft_gate_enabled:
+            refine_state["gate_prefix_embs"] = prefix_embs.detach()
+            refine_state["gate_prefix_pad_masks"] = prefix_pad_masks
         actions = self.refine_actions_from_force(
             refine_state, effort=effort, tactile_tokens=tactile_tokens, raw_pose_tactile=raw_pose_tactile
         )
@@ -2418,21 +2596,36 @@ class VLAFlowMatching(nn.Module):
         dt = torch.tensor(-1.0 / self.config.num_steps, dtype=torch.float32, device=device)
         remaining_steps = self.config.num_steps - self.config.force_refine_split_step
         pose_err = None
+        pose_confidence = None
+        soft_gate = None
+        gated_tactile_tokens = tactile_tokens
         if self.config.reference_pose_enabled:
             if raw_pose_tactile is None:
                 raise ValueError("PoseNet tactile input is required during inference.")
-            current_pose = self.predict_current_tactile_pose(raw_pose_tactile)
+            current_pose, pose_confidence = self.predict_current_tactile_pose_and_confidence(
+                raw_pose_tactile
+            )
+            if self.config.tactile_soft_gate_enabled:
+                soft_gate = self.compute_tactile_soft_gate(
+                    refine_state["gate_prefix_embs"],
+                    refine_state["gate_prefix_pad_masks"],
+                    tactile_tokens,
+                    pose_confidence,
+                )
+                gated_tactile_tokens = tactile_tokens * soft_gate[:, None, :].to(tactile_tokens)
             if self.config.force_shared_attention_enabled:
                 reference_pose = self.forward_reference_pose_from_action_cache(
                     prefix_pad_masks, self._detach_cache(past_key_values), x_t.detach(),
-                    time.expand(bsize).detach(), tactile_tokens, current_pose,
+                    time.expand(bsize).detach(), gated_tactile_tokens, current_pose,
                 )
             else:
                 reference_pose = self.forward_reference_pose_direct(
                     refine_state["prefix_embs"], prefix_pad_masks, refine_state["prefix_att_masks"],
-                    x_t.detach(), time.expand(bsize).detach(), tactile_tokens, current_pose,
+                    x_t.detach(), time.expand(bsize).detach(), gated_tactile_tokens, current_pose,
                 )
             pose_err = pose_error(current_pose, reference_pose)
+            if self.config.tactile_soft_gate_enabled:
+                pose_err = pose_err * pose_confidence.to(pose_err)
             self._last_pose_error = pose_err.detach()
             if self.config.reference_pose_detach_for_refine:
                 pose_err = pose_err.detach()
@@ -2456,16 +2649,29 @@ class VLAFlowMatching(nn.Module):
                 )
         for _ in range(remaining_steps):
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
+            tactile_v_t = self.denoise_step(
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
                 expanded_time,
                 effort,
-                tactile_tokens=tactile_tokens,
+                tactile_tokens=gated_tactile_tokens,
                 force_refine=True,
                 pose_error_token=pose_err,
             )
+            if self.config.tactile_soft_gate_enabled:
+                action_v_t = self.denoise_step(
+                    refine_state["action_prefix_pad_masks"],
+                    refine_state["action_past_key_values"],
+                    x_t,
+                    expanded_time,
+                    effort=None,
+                )
+                v_t = self.blend_action_tactile_velocity(
+                    action_v_t, tactile_v_t, soft_gate
+                )
+            else:
+                v_t = tactile_v_t
             x_t += dt * v_t
             time += dt
         return x_t

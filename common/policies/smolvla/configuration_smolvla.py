@@ -105,6 +105,13 @@ class SmolVLAConfig(PreTrainedConfig):
     # preventing tactile-refinement loss from updating its expert through e_t.
     reference_pose_detach_for_refine: bool = True
 
+    # Confidence-aware visual/tactile soft gating.  Disabled by default so
+    # existing FR-VLA checkpoints retain their exact architecture.
+    tactile_soft_gate_enabled: bool = False
+    tactile_soft_gate_hidden_dim: int = 256
+    tactile_soft_gate_gripper_index: int = 6
+    pose_confidence_key: str = "observation.tactile_pose_confidence"
+
     posenet_enabled: bool = False
     posenet_checkpoint_path: str = ""
     posenet_module_root: str = "/home/zhou/vla/force-vla/lerobot-mujoco-vla"
@@ -299,6 +306,13 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("`reference_pose_future_delta` must be >= 0.")
             if self.reference_pose_loss_weight < 0:
                 raise ValueError("`reference_pose_loss_weight` must be >= 0.")
+        if self.tactile_soft_gate_enabled:
+            if not self.reference_pose_enabled:
+                raise ValueError("`tactile_soft_gate_enabled=True` requires `reference_pose_enabled=True`.")
+            if self.tactile_soft_gate_hidden_dim < 1:
+                raise ValueError("`tactile_soft_gate_hidden_dim` must be positive.")
+            if self.tactile_soft_gate_gripper_index < 0:
+                raise ValueError("`tactile_soft_gate_gripper_index` must be >= 0.")
         if self.posenet_enabled and (not self.posenet_checkpoint_path or not self.posenet_module_root):
             raise ValueError("Set `posenet_checkpoint_path` and `posenet_module_root` when PoseNet is enabled.")
         if self.tactile_tokenizer_enabled:
@@ -425,6 +439,8 @@ class SmolVLAConfig(PreTrainedConfig):
                         type=FeatureType.ENV,
                         shape=self.tactile_raw_shape,
                     )
+        if self.tactile_soft_gate_enabled and self.pose_confidence_key in self.input_features:
+            self.input_features[self.pose_confidence_key].type = FeatureType.ENV
         if self.tacforce_wm_enabled:
             if self.effort_key in self.input_features:
                 self.input_features[self.effort_key].type = FeatureType.ENV
@@ -466,6 +482,8 @@ class SmolVLAConfig(PreTrainedConfig):
             return list(range(1 - self.tacforce_wm_history_steps, 1))
         if self.reference_pose_enabled and key == self.reference_pose_key:
             return [self.reference_pose_future_delta]
+        if self.tactile_soft_gate_enabled and key == self.pose_confidence_key:
+            return [0]
         return [0]
 
     @property

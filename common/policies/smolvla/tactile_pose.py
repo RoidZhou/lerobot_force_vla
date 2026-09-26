@@ -65,10 +65,12 @@ class FrozenPoseNet(nn.Module):
         self.grid_size = int(checkpoint.get("grid_size", 32))
         self.sensor_shape = tuple(sensor_shape or (int(sensor_grid_size), int(sensor_grid_size)))
         self.allow_sensor_resize = bool(allow_sensor_resize)
+        self.predicts_confidence = bool(checkpoint.get("predict_confidence", False))
         self.model = create_model(
             model_type,
             grid_size=self.grid_size,
             image_size=int(checkpoint.get("model_image_size", 128)),
+            predict_confidence=self.predicts_confidence,
         )
         self.model.load_state_dict(checkpoint["model_state_dict"])
         norm = checkpoint["normalization"]
@@ -108,8 +110,21 @@ class FrozenPoseNet(nn.Module):
         x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
         # Keep xxx/PoseNet behavior: its regressor pads rectangular maps to a
         # square and resizes internally before invoking the tokenizer.
-        output = self.model(x)
+        if self.predicts_confidence:
+            output, confidence_logit = self.model.forward_with_confidence(x)
+            self._last_pose_confidence = torch.sigmoid(confidence_logit)
+        else:
+            output = self.model(x)
+            self._last_pose_confidence = torch.ones(
+                (x.shape[0], 1), device=x.device, dtype=x.dtype
+            )
         return output * self.target_std + self.target_mean
+
+    @torch.no_grad()
+    def forward_with_confidence(self, tactile: Tensor) -> tuple[Tensor, Tensor]:
+        """Return physical nut-local pose and confidence without changing forward()."""
+        pose = self.forward(tactile)
+        return pose, self._last_pose_confidence
 
 
 class FrozenPoseTactileTokenizer(nn.Module):
@@ -140,6 +155,7 @@ class FrozenPoseTactileTokenizer(nn.Module):
         pose_model = create_model(
             "tactile_tokenizer", grid_size=self.grid_size,
             image_size=int(checkpoint.get("model_image_size", 128)),
+            predict_confidence=bool(checkpoint.get("predict_confidence", False)),
         )
         pose_model.load_state_dict(checkpoint["model_state_dict"])
         self.tokenizer = pose_model.tokenizer
